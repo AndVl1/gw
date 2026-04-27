@@ -105,6 +105,7 @@ jobs:
             dist/*.sha256
             dist/checksums.txt
           prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

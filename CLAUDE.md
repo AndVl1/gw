@@ -42,27 +42,61 @@ CI on push/PR: fmt + clippy + test on `ubuntu-latest`, `macos-latest`.
 
 ## Release Flow
 
-Automated via release-please + reusable workflow.
+Tag-driven via `cargo-release` locally + reusable CI workflow.
 
 ```
-push main
-  → release-please parses conventional commits
-  → opens chore(main): release X.Y.Z PR (Cargo.toml + CHANGELOG bumped)
-  → merge PR → tag vX.Y.Z + GH release
-  → reusable release.yml builds 4 targets, uploads tarballs + sha256
-  → homebrew job pushes Formula/gw.rb to AndVl1/homebrew-tap
+local: cargo release <bump> --execute
+  → bumps Cargo.toml + Cargo.lock
+  → commits "chore(release): vX.Y.Z"
+  → tags vX.Y.Z
+  → pushes commit + tag to origin
+
+remote: push of tag v* triggers cd.yml
+  → calls reusable release.yml
+  → builds 4 targets, uploads tarballs + sha256 + checksums
+  → softprops/action-gh-release creates GH release with auto-generated notes
+  → homebrew job rewrites Formula/gw.rb in AndVl1/homebrew-tap
 ```
 
-Bump rules (`bump-minor-pre-major: true`, pre-1.0):
-- `feat:` → minor (0.1.0 → 0.2.0)
-- `fix:` → patch (0.2.0 → 0.2.1)
-- `feat!:` / `BREAKING CHANGE:` → minor pre-1.0, major post-1.0
+### Cutting a release
 
-Path filter (`include-paths`): only commits touching `src/`, `Cargo.toml`, or `Cargo.lock` count toward bump. `feat:` with diff confined to `README.md` / `.github/**` is ignored — relabel as `docs:` / `ci:`. Mixed commits (src + docs) still count.
+```bash
+# Patch bump (0.2.0 → 0.2.1) — bug fixes only
+cargo release patch --execute
 
-Manual trigger fallback: `workflow_dispatch` on `release.yml` with explicit tag.
+# Minor bump (0.2.0 → 0.3.0) — new features
+cargo release minor --execute
 
-Required secret: `TAP_GITHUB_TOKEN` (PAT with write to `AndVl1/homebrew-tap`).
+# Specific version
+cargo release 0.5.0 --execute
+
+# Dry-run first if unsure (drop --execute)
+cargo release patch
+```
+
+Pre-flight: `cargo-release` runs `cargo test` + checks branch/clean state. Aborts if dirty or off main.
+
+### Manual fallback
+
+If `cargo-release` is unavailable: bump `Cargo.toml` version manually, commit, tag, push:
+
+```bash
+git tag v0.2.1 && git push origin v0.2.1
+```
+
+Or trigger `release.yml` via `workflow_dispatch` with explicit tag input.
+
+### Required secrets
+
+- `TAP_GITHUB_TOKEN` — PAT with write to `AndVl1/homebrew-tap`
+
+### Versioning rules (manual judgment, no longer auto)
+
+- `fix:` only → patch
+- `feat:` → minor
+- Breaking change → minor pre-1.0, major post-1.0
+
+Pick bump level by reading `git log v<last>..HEAD --oneline` before running `cargo release`.
 
 ## Commit Convention
 
