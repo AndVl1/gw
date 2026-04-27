@@ -10,7 +10,7 @@ Wraps `./gradlew` (and any wrapper around it: `./mainframer ./gradlew`, `ssh hos
 
 ## Install
 
-### Homebrew (macOS / Linux)
+### Homebrew (macOS)
 
 ```bash
 brew tap AndVl1/tap
