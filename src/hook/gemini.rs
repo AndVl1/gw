@@ -1,3 +1,13 @@
+//! Gemini CLI BeforeTool hook entry.
+//!
+//! Stdin schema (Gemini CLI):
+//! ```json
+//! { "tool_name": "bash", "tool_input": { "command": "..." }, ... }
+//! ```
+//! Stdout: similar JSON shape with `decision: "allow"`, optional rewrite via
+//! `tool_input` mutation. Spec across versions is unstable — we mirror the
+//! Claude-style envelope which Gemini CLI's recent docs describe as compatible.
+
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::Read;
@@ -22,12 +32,10 @@ pub fn run() -> Result<i32> {
         return Ok(0);
     };
     let out = json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "permissionDecisionReason": "gw filter (auto-wrap gradlew)",
-            "updatedInput": { "command": rewritten }
-        }
+        "decision": "allow",
+        "continue": true,
+        "tool_input": { "command": rewritten },
+        "systemMessage": "gw filter (auto-wrap gradlew)"
     });
     println!("{}", out);
     Ok(0)

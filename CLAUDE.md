@@ -22,8 +22,8 @@ src/
   summary.rs     # final stderr summary
   stats.rs       # JSONL append at ~/.local/share/gw/runs.jsonl
   gain.rs        # `gw gain` aggregation + output
-  hook/          # `gw init` Claude Code settings patcher
-  init/          # init helpers
+  hook/          # per-agent hook entries (claude/gemini/cursor + detect)
+  init/          # multi-agent install/uninstall (json_hook, rules, opencode)
 tests/
   integration.rs # end-to-end runner tests
   fixtures/      # canned gradle output

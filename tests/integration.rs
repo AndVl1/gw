@@ -277,3 +277,197 @@ fn sigint_forwarded_to_child() {
         );
     }
 }
+
+/// `gw hook gemini-cli` parses Gemini's tool_input shape and emits an
+/// allow+rewrite envelope.
+#[test]
+fn hook_gemini_rewrites_gradle() {
+    let mut child = Command::new(bin())
+        .args(["hook", "gemini-cli"])
+        .env_remove("HOME")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    let payload = r#"{"tool_name":"bash","tool_input":{"command":"./gradlew test"}}"#;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("hook output is JSON");
+    assert_eq!(v["decision"], "allow");
+    assert_eq!(v["tool_input"]["command"], "gw ./gradlew test");
+}
+
+/// `gw hook cursor` denies and instructs the agent to retry — Cursor lacks
+/// an in-band rewrite mechanism.
+#[test]
+fn hook_cursor_denies_with_retry_message() {
+    let mut child = Command::new(bin())
+        .args(["hook", "cursor"])
+        .env_remove("HOME")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    let payload = r#"{"command":"./gradlew assembleDebug","cwd":"/tmp","hook_event_name":"beforeShellExecution"}"#;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("hook output is JSON");
+    assert_eq!(v["permission"], "deny");
+    let msg = v["agentMessage"].as_str().unwrap();
+    assert!(
+        msg.contains("gw ./gradlew assembleDebug"),
+        "agentMessage should embed rewritten command: {msg}"
+    );
+}
+
+/// `gw hook <unknown>` exits non-zero with an error message.
+#[test]
+fn hook_unknown_agent_errors() {
+    let (code, _, stderr) = run_gw(&["hook", "nope"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("unknown agent"), "stderr: {stderr}");
+}
+
+/// `gw init --agent codex --local` writes AGENTS.md with marker block.
+#[test]
+fn init_codex_local_writes_agents_md() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["init", "--agent", "codex", "--local"])
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw init");
+    assert_eq!(out.status.code(), Some(0));
+    let agents = dir.path().join("AGENTS.md");
+    assert!(agents.exists());
+    let content = std::fs::read_to_string(&agents).unwrap();
+    assert!(content.contains("<!-- gw:begin -->"));
+    assert!(content.contains("<!-- gw:end -->"));
+    assert!(content.contains("Build Commands"));
+
+    // Idempotent: second invocation should be a no-op (no extra block).
+    let out2 = Command::new(bin())
+        .args(["init", "--agent", "codex", "--local"])
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw init #2");
+    assert_eq!(out2.status.code(), Some(0));
+    let content2 = std::fs::read_to_string(&agents).unwrap();
+    assert_eq!(content.matches("<!-- gw:begin -->").count(), 1);
+    assert_eq!(content2.matches("<!-- gw:begin -->").count(), 1);
+
+    // Uninstall removes the block.
+    let out3 = Command::new(bin())
+        .args(["uninstall", "--agent", "codex", "--local"])
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw uninstall");
+    assert_eq!(out3.status.code(), Some(0));
+    // File should be gone (only our block remained).
+    assert!(!agents.exists());
+}
+
+/// `gw init --gemini-cli --local` writes Gemini settings with BeforeTool hook.
+#[test]
+fn init_gemini_local_writes_settings() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["init", "--gemini-cli", "--local"])
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw init");
+    assert_eq!(out.status.code(), Some(0));
+    let settings = dir.path().join(".gemini/settings.json");
+    assert!(settings.exists());
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let arr = v["hooks"]["BeforeTool"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["command"], "gw hook gemini-cli");
+    assert_eq!(arr[0]["matcher"]["tool"], "bash");
+
+    // Companion docs note (GEMINI.md) created.
+    let docs = dir.path().join("GEMINI.md");
+    assert!(docs.exists());
+    let docs_content = std::fs::read_to_string(&docs).unwrap();
+    assert!(docs_content.contains("auto-intercepted"));
+}
+
+/// `gw init --cursor --local` writes Cursor hooks.json with beforeShellExecution.
+#[test]
+fn init_cursor_local_writes_hooks_json() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["init", "--cursor", "--local"])
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw init");
+    assert_eq!(out.status.code(), Some(0));
+    let hooks = dir.path().join(".cursor/hooks.json");
+    assert!(hooks.exists());
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+    assert_eq!(v["version"], 1);
+    let arr = v["hooks"]["beforeShellExecution"].as_array().unwrap();
+    assert_eq!(arr[0]["command"], "gw hook cursor");
+}
+
+/// Multi-target install in one invocation.
+#[test]
+fn init_multi_target_local() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["init", "--codex", "--cline", "--local"])
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw init");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(dir.path().join("AGENTS.md").exists());
+    assert!(dir.path().join(".clinerules").exists());
+}
+
+/// Local-only agent with --global (default) scope warns and skips.
+#[test]
+fn init_cline_global_warns_and_skips() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["init", "--cline"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path().to_str().unwrap())
+        .output()
+        .expect("spawn gw init");
+    // Should succeed (skip is not an error) but warn on stderr.
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not support") && stderr.contains("global"),
+        "expected scope-skip warning on stderr, got: {stderr}"
+    );
+}

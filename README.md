@@ -88,14 +88,47 @@ gw init
 Project-local install:
 
 ```bash
-gw init --local        # patch ./.claude/settings.local.json
+gw init --local        # patch ./.claude/settings.local.json (Claude Code default)
 ```
+
+### Other agents
+
+`gw init` defaults to Claude Code. Pick another agent — or several at once:
+
+```bash
+gw init --gemini-cli                       # ~/.gemini/settings.json (BeforeTool hook)
+gw init --cursor                           # ~/.cursor/hooks.json (beforeShellExecution)
+gw init --opencode                         # ~/.config/opencode/plugin/gw.ts
+gw init --agent codex --local              # ./AGENTS.md (rules block)
+gw init --claude-code --gemini-cli         # multi-target in one run
+gw init --all --local                      # everything supported in this project
+```
+
+Per-agent integration mechanism:
+
+| Agent | Mechanism | Default file (global) | Local file |
+|---|---|---|---|
+| `claude-code` | PreToolUse hook + companion `CLAUDE.md` note | `~/.claude/settings.json` | `.claude/settings.local.json` |
+| `gemini-cli` | BeforeTool hook + companion `GEMINI.md` note | `~/.gemini/settings.json` | `.gemini/settings.json` |
+| `cursor` | `beforeShellExecution` hook + `AGENTS.md` note | `~/.cursor/hooks.json` | `.cursor/hooks.json` |
+| `opencode` | TS plugin (`tool.execute.before`) shelling out to `gw rewrite` | `~/.config/opencode/plugin/gw.ts` | `.opencode/plugin/gw.ts` |
+| `codex` | Markdown rules block | `~/.codex/AGENTS.md` | `AGENTS.md` |
+| `kilocode` | Markdown rules block | `~/.kilocode/rules/gw.md` | `.kilocode/rules/gw.md` |
+| `cline` | Markdown rules block | — (local-only) | `.clinerules` |
+| `windsurf` | Markdown rules block | — (local-only) | `.windsurfrules` |
+| `antigravity` | Markdown rules block | — (local-only) | `AGENTS.md` |
+| `copilot` | Markdown rules block | — (local-only) | `.github/copilot-instructions.md` |
+
+Cursor lacks an in-band rewrite mechanism, so its hook denies the call with a `userMessage` instructing the agent to retry the command prefixed with `gw `. Other hook-based agents auto-rewrite transparently.
+
+Rules-based agents (codex/cline/windsurf/...) get an instructional block delimited by `<!-- gw:begin -->` / `<!-- gw:end -->` markers — only that range is rewritten on update or removed on uninstall, so any surrounding content stays untouched.
 
 Uninstall:
 
 ```bash
-gw init --uninstall          # global
-gw init --local --uninstall  # project-local
+gw uninstall                               # Claude Code, global
+gw uninstall --gemini-cli --cursor         # multiple agents at once
+gw uninstall --all --local                 # everything in this project
 ```
 
 ## Usage
@@ -185,7 +218,7 @@ Full log: ./build-logs/gw-2026-04-27_18-38-26.log
 
 ```bash
 echo '{"tool_name":"Bash","tool_input":{"command":"./gradlew assemble"}}' \
-  | gw hook claude
+  | gw hook claude-code
 ```
 
 prints
@@ -194,7 +227,7 @@ prints
 {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"gw filter (auto-wrap gradlew)","updatedInput":{"command":"gw ./gradlew assemble"}}}
 ```
 
-For non-matching commands, the hook exits 0 with empty stdout (Claude Code passes the command through unmodified).
+Per-agent hook subcommands: `gw hook claude-code` (alias: `gw hook claude`), `gw hook gemini-cli`, `gw hook cursor`. For non-matching commands, every hook exits 0 with empty stdout so the command passes through unmodified.
 
 You can also test the rewrite logic directly:
 
@@ -236,9 +269,17 @@ src/
 ├── hook/
 │   ├── detect.rs          # ENV_PREFIX strip + gradlew regex + idempotency
 │   └── claude.rs          # stdin JSON → stdout hookSpecificOutput
+├── hook/
+│   ├── claude.rs          # Claude Code: hookSpecificOutput envelope
+│   ├── gemini.rs          # Gemini CLI: decision/tool_input envelope
+│   └── cursor.rs          # Cursor: deny + agentMessage retry
 └── init/
-    ├── consts.rs          # HOOK_COMMAND etc.
-    └── settings.rs        # idempotent settings.json patcher with .bak
+    ├── agent.rs           # Agent enum + per-agent paths/kinds
+    ├── consts.rs          # hook commands, marker tokens, rule bodies
+    ├── settings.rs        # atomic write + .bak rotation + O_NOFOLLOW
+    ├── json_hook.rs       # Claude/Gemini/Cursor JSON-settings patcher
+    ├── rules.rs           # marker-block install/uninstall for rule files
+    └── opencode.rs        # TS plugin emit (tool.execute.before)
 tests/
 ├── fixtures/              # raw gradle outputs for end-to-end tests
 └── integration.rs         # spawn-the-binary tests

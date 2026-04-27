@@ -15,6 +15,7 @@ use clap::Parser;
 
 use crate::cli::{Cli, Dispatch};
 use crate::filter::Mode;
+use crate::init::Scope;
 use crate::runner::RunOptions;
 
 fn main() {
@@ -35,20 +36,21 @@ fn real_main() -> Result<i32> {
             eprintln!("{msg}");
             Ok(2)
         }
-        Ok(Dispatch::Init { local, uninstall }) => {
-            let scope = if local {
-                init::Scope::Local
-            } else {
-                init::Scope::Global
-            };
-            if uninstall {
-                init::uninstall(scope)?;
-            } else {
-                init::install(scope)?;
+        Ok(Dispatch::Init { agents, local }) => {
+            let scope = scope_for(local);
+            for a in agents {
+                init::install(a, scope)?;
             }
             Ok(0)
         }
-        Ok(Dispatch::HookClaude) => hook::run_claude_hook(),
+        Ok(Dispatch::Uninstall { agents, local }) => {
+            let scope = scope_for(local);
+            for a in agents {
+                init::uninstall(a, scope)?;
+            }
+            Ok(0)
+        }
+        Ok(Dispatch::Hook(name)) => hook::dispatch(&name),
         Ok(Dispatch::Gain(rest)) => match gain::parse_args(rest) {
             Ok(opts) => gain::run(opts),
             Err(msg) => {
@@ -90,5 +92,13 @@ fn real_main() -> Result<i32> {
             };
             runner::run(cmd, opts)
         }
+    }
+}
+
+fn scope_for(local: bool) -> Scope {
+    if local {
+        Scope::Local
+    } else {
+        Scope::Global
     }
 }
