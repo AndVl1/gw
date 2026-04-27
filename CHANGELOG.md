@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/AndVl1/gw/compare/v0.1.1...v0.2.0) (2026-04-27)
+
+
+### Features
+
+* **heartbeat:** emit to stdout unconditionally every 30s ([1dd30c5](https://github.com/AndVl1/gw/commit/1dd30c5f2a42159a7c268226921687359edd75ef))
+
 ## [0.1.1](https://github.com/AndVl1/gw/compare/v0.1.0...v0.1.1) (2026-04-27)
 
 
