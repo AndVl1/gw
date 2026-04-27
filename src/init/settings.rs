@@ -11,7 +11,7 @@ pub fn global_path() -> Option<PathBuf> {
 }
 
 pub fn local_path() -> PathBuf {
-    PathBuf::from(".claude").join("settings.json")
+    PathBuf::from(".claude").join("settings.local.json")
 }
 
 fn dirs_home() -> Option<PathBuf> {

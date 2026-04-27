@@ -54,7 +54,7 @@ gw init
 Project-local install:
 
 ```bash
-gw init --local        # patch ./.claude/settings.json
+gw init --local        # patch ./.claude/settings.local.json
 ```
 
 Uninstall:
