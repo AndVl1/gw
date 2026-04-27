@@ -1,0 +1,18 @@
+Starting a Gradle Daemon (subsequent builds will be faster)
+> Configure project :app
+> Task :app:checkKotlinGradlePluginConfigurationErrors
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preDebugBuild UP-TO-DATE
+Download https://repo1.maven.org/maven2/com/foo/bar/1.0/bar-1.0.pom
+Downloaded https://repo1.maven.org/maven2/com/foo/bar/1.0/bar-1.0.jar
+> Task :app:compileDebugKotlin
+w: /home/user/proj/app/src/main/kotlin/com/example/Foo.kt:5:13 Parameter 'unused' is never used
+> Task :app:compileDebugKotlin UP-TO-DATE
+> Task :app:compileDebugJavaWithJavac UP-TO-DATE
+> Task :app:assembleDebug
+
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 9.0.
+Use --warning-mode all to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+
+BUILD SUCCESSFUL in 12s
+47 actionable tasks: 12 executed, 33 up-to-date, 2 from cache
