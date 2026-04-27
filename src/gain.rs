@@ -98,11 +98,7 @@ fn print_summary<W: Write>(runs: &[Run], since_secs: Option<i64>, w: &mut W) -> 
         fmt_bytes(a.bytes_forwarded),
         bytes_pct
     )?;
-    let avg = if a.runs > 0 {
-        a.duration_ms_total / a.runs
-    } else {
-        0
-    };
+    let avg = a.duration_ms_total / a.runs;
     writeln!(
         w,
         "Time:    avg {}/build, {} failed",
