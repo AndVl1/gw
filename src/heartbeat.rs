@@ -8,15 +8,18 @@ pub struct HeartbeatState {
     pub current_task: Option<String>,
     pub task_started_at: Option<Instant>,
     pub last_output_at: Instant,
+    pub started_at: Instant,
     pub stop: bool,
 }
 
 impl HeartbeatState {
     pub fn new() -> Self {
+        let now = Instant::now();
         Self {
             current_task: None,
             task_started_at: None,
-            last_output_at: Instant::now(),
+            last_output_at: now,
+            started_at: now,
             stop: false,
         }
     }
@@ -67,7 +70,7 @@ impl Heartbeat {
 fn heartbeat_loop(state: Arc<Mutex<HeartbeatState>>, silent_threshold: Duration, tick: Duration) {
     loop {
         thread::sleep(tick);
-        let mut emit: Option<(String, Duration)> = None;
+        let mut emit: Option<(Option<String>, Duration)> = None;
         {
             let mut s = match state.lock() {
                 Ok(s) => s,
@@ -79,17 +82,19 @@ fn heartbeat_loop(state: Arc<Mutex<HeartbeatState>>, silent_threshold: Duration,
             let now = Instant::now();
             let silent_for = now.duration_since(s.last_output_at);
             if silent_for >= silent_threshold {
-                if let (Some(task), Some(started)) = (s.current_task.clone(), s.task_started_at) {
-                    let elapsed = now.duration_since(started);
-                    emit = Some((task, elapsed));
-                    s.last_output_at = now;
-                }
+                let elapsed = match (s.current_task.as_ref(), s.task_started_at) {
+                    (Some(_), Some(started)) => now.duration_since(started),
+                    _ => now.duration_since(s.started_at),
+                };
+                emit = Some((s.current_task.clone(), elapsed));
+                s.last_output_at = now;
             }
         }
         if let Some((task, elapsed)) = emit {
-            let stderr = std::io::stderr();
-            let mut h = stderr.lock();
-            let _ = writeln!(h, "▸ {} ({}s)", task, elapsed.as_secs());
+            let stdout = std::io::stdout();
+            let mut h = stdout.lock();
+            let label = task.as_deref().unwrap_or("building");
+            let _ = writeln!(h, "▸ {} ({}s)", label, elapsed.as_secs());
             let _ = h.flush();
         }
     }

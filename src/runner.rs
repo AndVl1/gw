@@ -72,7 +72,7 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
 
     let heartbeat = if opts.heartbeat {
         Some(Heartbeat::start(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(30),
             std::time::Duration::from_millis(500),
         ))
     } else {
