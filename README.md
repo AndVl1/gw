@@ -10,18 +10,53 @@ Wraps `./gradlew` (and any wrapper around it: `./mainframer ./gradlew`, `ssh hos
 
 ## Install
 
-### Homebrew (macOS)
+### One-liner (macOS / Linux)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/AndVl1/gw/main/scripts/install.sh | sh
+gw init                # patch ~/.claude/settings.json (PreToolUse hook)
+```
+
+Pin a version or override install dir:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/AndVl1/gw/main/scripts/install.sh | sh -s -- --version v0.2.4 --dir /usr/local/bin
+```
+
+Default install dir: `$HOME/.local/bin`. Verifies sha256 by default.
+
+### One-liner (Windows)
+
+PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/AndVl1/gw/main/scripts/install.ps1 | iex
+gw init
+```
+
+Default install dir: `%LOCALAPPDATA%\Programs\gw` (added to user `PATH` automatically). Restart your shell after first install.
+
+### Homebrew (macOS, Linux)
+
+Works on macOS and Linux with [Linuxbrew](https://docs.brew.sh/Homebrew-on-Linux):
 
 ```bash
 brew tap AndVl1/tap
 brew install gw
-gw init                # patch ~/.claude/settings.json (PreToolUse hook)
+gw init
 ```
 
 Upgrade:
 
 ```bash
 brew update && brew upgrade gw
+```
+
+### winget (Windows)
+
+```powershell
+winget install AndVl1.gw
+gw init
 ```
 
 ### From source
@@ -31,16 +66,15 @@ cargo install --path .
 gw init
 ```
 
-### Prebuilt binary
+### Prebuilt binary (manual)
 
-Download tarball for your target from the [latest release](https://github.com/AndVl1/gw/releases/latest):
+Download from the [latest release](https://github.com/AndVl1/gw/releases/latest):
 
-- `gw-<version>-aarch64-apple-darwin.tar.gz`
-- `gw-<version>-x86_64-apple-darwin.tar.gz`
-- `gw-<version>-aarch64-unknown-linux-gnu.tar.gz`
-- `gw-<version>-x86_64-unknown-linux-gnu.tar.gz`
+- macOS: `gw-<version>-{aarch64,x86_64}-apple-darwin.tar.gz`
+- Linux: `gw-<version>-{aarch64,x86_64}-unknown-linux-gnu.tar.gz`
+- Windows: `gw-<version>-{aarch64,x86_64}-pc-windows-msvc.zip`
 
-Verify:
+Verify and install (Unix):
 
 ```bash
 shasum -a 256 -c gw-<version>-<target>.tar.gz.sha256

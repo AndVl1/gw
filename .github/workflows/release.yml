@@ -38,13 +38,23 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
+            archive: tar.gz
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,7 +72,8 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - run: cargo build --release --target ${{ matrix.target }} --locked
-      - name: Package
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           set -euo pipefail
@@ -75,11 +86,28 @@ jobs:
           (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
         env:
           TAG: ${{ inputs.tag }}
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${env:TAG}".TrimStart("v")
+          $name = "gw-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/gw.exe" "dist/$name/"
+          if (Test-Path "README.md") { Copy-Item "README.md" "dist/$name/" }
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "dist/$name/" }
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.zip").Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+        env:
+          TAG: ${{ inputs.tag }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
 
   release:
@@ -95,13 +123,14 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Compute combined checksums
-        run: (cd dist && sha256sum *.tar.gz > checksums.txt)
+        run: (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
             dist/checksums.txt
           prerelease: ${{ inputs.prerelease }}
@@ -202,3 +231,23 @@ jobs:
               -f message="gw ${{ steps.version.outputs.version }}" \
               -f content="$CONTENT"
           fi
+
+  winget:
+    name: Update winget manifest
+    needs: release
+    if: ${{ !inputs.prerelease }}
+    runs-on: windows-latest
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag }}"
+          echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Submit to winget-pkgs
+        uses: vedantmgoyal9/winget-releaser@main
+        with:
+          identifier: AndVl1.gw
+          version: ${{ steps.version.outputs.value }}
+          installers-regex: '\.zip$'
+          token: ${{ secrets.WINGET_GITHUB_TOKEN }}
