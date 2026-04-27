@@ -107,13 +107,15 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
         let decision = processor.process(&line);
         if let Some(hb) = &heartbeat {
             hb.set_task(processor.current_task.clone());
-            hb.note_output();
         }
         if matches!(decision, Decision::Forward) {
             lines_forwarded += 1;
             bytes_forwarded += line.len() as u64 + 1;
             let _ = writeln!(out, "{}", line);
             let _ = out.flush();
+            if let Some(hb) = &heartbeat {
+                hb.note_output();
+            }
         }
     }
 
