@@ -10,9 +10,43 @@ Wraps `./gradlew` (and any wrapper around it: `./mainframer ./gradlew`, `ssh hos
 
 ## Install
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap AndVl1/tap
+brew install gw
+gw init                # patch ~/.claude/settings.json (PreToolUse hook)
+```
+
+Upgrade:
+
+```bash
+brew update && brew upgrade gw
+```
+
+### From source
+
 ```bash
 cargo install --path .
-gw init                # patch ~/.claude/settings.json (PreToolUse hook)
+gw init
+```
+
+### Prebuilt binary
+
+Download tarball for your target from the [latest release](https://github.com/AndVl1/gw/releases/latest):
+
+- `gw-<version>-aarch64-apple-darwin.tar.gz`
+- `gw-<version>-x86_64-apple-darwin.tar.gz`
+- `gw-<version>-aarch64-unknown-linux-gnu.tar.gz`
+- `gw-<version>-x86_64-unknown-linux-gnu.tar.gz`
+
+Verify:
+
+```bash
+shasum -a 256 -c gw-<version>-<target>.tar.gz.sha256
+tar -xzf gw-<version>-<target>.tar.gz
+sudo mv gw-<version>-<target>/gw /usr/local/bin/
+gw init
 ```
 
 `gw init` is idempotent and creates a `.bak` of any pre-existing settings file before writing.
