@@ -43,13 +43,12 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
         .spawn()
         .with_context(|| format!("failed to spawn {:?}", args))?;
 
-    let child_pid = child.id();
-
     // Install Ctrl-C handler: forward SIGTERM to the child so Gradle can clean up.
     // The handler is set once per process; ignore "already set" errors that appear
     // in test suites where run() is called multiple times.
     #[cfg(unix)]
     {
+        let child_pid = child.id();
         let _ = ctrlc::set_handler(move || {
             send_sigterm(child_pid);
         });

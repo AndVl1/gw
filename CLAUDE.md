@@ -89,6 +89,20 @@ Or trigger `release.yml` via `workflow_dispatch` with explicit tag input.
 ### Required secrets
 
 - `TAP_GITHUB_TOKEN` — PAT with write to `AndVl1/homebrew-tap`
+- `WINGET_GITHUB_TOKEN` — classic PAT with `public_repo` scope. Used by `vedantmgoyal9/winget-releaser` to fork `microsoft/winget-pkgs` and open update PR.
+
+### Winget bootstrap (one-time)
+
+Action only updates an *existing* manifest. First submission must be manual:
+
+```bash
+# On a Windows machine
+winget install wingetcreate
+wingetcreate new <url-to-zip-asset>
+# follow prompts; package id: AndVl1.gw
+```
+
+After first manifest lands in `microsoft/winget-pkgs`, every release tag auto-PRs an update.
 
 ### Versioning rules (manual judgment, no longer auto)
 
