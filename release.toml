@@ -1,31 +1,14 @@
 # cargo-release config: https://github.com/crate-ci/cargo-release/blob/master/docs/reference.md
 
-# Don't publish to crates.io — distribution is via GH releases + Homebrew
 publish = false
-
-# Push tag + bump commit to origin
 push = true
-
-# Tag format: v0.2.1
 tag-name = "v{{version}}"
-
-# Commit messages
 pre-release-commit-message = "chore(release): v{{version}}"
-
-# Don't sign by default (CI doesn't have keys)
 sign-tag = false
 sign-commit = false
-
-# Only release from main
 allow-branch = ["main"]
-
-# Verify before push
 verify = true
 
-# Skip cargo publish dry-run since publish=false
-publish-timeout = 0
-
-# Update CHANGELOG.md if present
 pre-release-replacements = [
   { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 0 },
   { file = "CHANGELOG.md", search = "ReleaseDate", replace = "{{date}}", min = 0 },
