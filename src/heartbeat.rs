@@ -52,7 +52,6 @@ impl Heartbeat {
             if s.current_task != task {
                 s.task_started_at = task.as_ref().map(|_| Instant::now());
                 s.current_task = task;
-                s.last_output_at = Instant::now();
             }
         }
     }
