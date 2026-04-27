@@ -30,6 +30,30 @@ fn run_gw(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// End-to-end heartbeat smoke test. With a short silent threshold, gw should
+/// emit at least one "▸ building" heartbeat line on stdout while the wrapped
+/// command produces no output. Also verifies gw exits cleanly afterwards
+/// (regression test for the stdout-lock deadlock between main and heartbeat
+/// thread).
+#[test]
+fn heartbeat_fires_during_silent_command() {
+    let out = Command::new(bin())
+        .args(["--no-log", "sleep", "3"])
+        .env_remove("HOME")
+        .env("GW_HEARTBEAT_SILENT_SECS", "1")
+        .output()
+        .expect("spawn gw");
+
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(code, 0, "gw should exit cleanly; stdout: {stdout}");
+    assert!(
+        stdout.contains("▸ building"),
+        "expected at least one heartbeat line, got stdout: {stdout}"
+    );
+}
+
 #[test]
 fn filters_successful_build() {
     let path = fixture("sample-success.txt");

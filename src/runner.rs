@@ -71,8 +71,12 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
     let h_err = thread::spawn(move || pipe_lines(stderr, tx_err));
 
     let heartbeat = if opts.heartbeat {
+        let secs = std::env::var("GW_HEARTBEAT_SILENT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
         Some(Heartbeat::start(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(secs),
             std::time::Duration::from_millis(500),
         ))
     } else {
@@ -81,7 +85,6 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
 
     let mut processor = Processor::new(opts.mode);
     let stdout_h = std::io::stdout();
-    let mut out = stdout_h.lock();
 
     // Track whether we already warned about a failing log write so we don't
     // spam the user on every subsequent line.
@@ -111,8 +114,13 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
         if matches!(decision, Decision::Forward) {
             lines_forwarded += 1;
             bytes_forwarded += line.len() as u64 + 1;
-            let _ = writeln!(out, "{}", line);
-            let _ = out.flush();
+            // Lock per-line so the heartbeat thread can interleave stdout
+            // writes; pre-locking the handle would deadlock the heartbeat.
+            {
+                let mut out = stdout_h.lock();
+                let _ = writeln!(out, "{}", line);
+                let _ = out.flush();
+            }
             if let Some(hb) = &heartbeat {
                 hb.note_output();
             }
