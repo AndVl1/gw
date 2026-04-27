@@ -58,6 +58,8 @@ Bump rules (`bump-minor-pre-major: true`, pre-1.0):
 - `fix:` → patch (0.2.0 → 0.2.1)
 - `feat!:` / `BREAKING CHANGE:` → minor pre-1.0, major post-1.0
 
+Path filter (`include-paths`): only commits touching `src/`, `Cargo.toml`, or `Cargo.lock` count toward bump. `feat:` with diff confined to `README.md` / `.github/**` is ignored — relabel as `docs:` / `ci:`. Mixed commits (src + docs) still count.
+
 Manual trigger fallback: `workflow_dispatch` on `release.yml` with explicit tag.
 
 Required secret: `TAP_GITHUB_TOKEN` (PAT with write to `AndVl1/homebrew-tap`).

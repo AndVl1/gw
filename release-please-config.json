@@ -9,7 +9,8 @@
       "include-component-in-tag": false,
       "include-v-in-tag": true,
       "draft": false,
-      "prerelease": false
+      "prerelease": false,
+      "include-paths": ["src", "Cargo.toml", "Cargo.lock"]
     }
   }
 }
