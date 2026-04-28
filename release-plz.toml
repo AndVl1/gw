@@ -3,8 +3,11 @@
 # actual binary builds, GH release upload, Homebrew/winget updates.
 
 [workspace]
-# gw is a binary, not a published crate.
-publish = false
+# gw is a binary CLI; we don't publish to crates.io. `git_only` makes
+# release-plz use git tags (not the stale 0.2.0 entry on crates.io) as the
+# baseline for version computation. It also suppresses `cargo publish` —
+# do NOT also set `publish = false`, the two flags are mutually exclusive.
+git_only = true
 # cd.yml owns GH release creation (it has the built artifacts to upload).
 git_release_enable = false
 # Binary crate — semver check is for libraries.
