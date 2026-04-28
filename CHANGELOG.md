@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.4](https://github.com/AndVl1/gw/compare/v0.2.0...v0.2.4) - 2026-04-28
+
+### Added
+
+- *(init)* support 10 agent targets with multi-target install
+- install scripts (sh/ps1), Windows builds, Linuxbrew, winget
+
+### Other
+
+- add release-plz for auto version-bump PRs
+
 ## [0.2.1](https://github.com/AndVl1/gw/compare/v0.2.0...v0.2.1) (2026-04-27)
 
 
