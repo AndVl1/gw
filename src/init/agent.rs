@@ -160,3 +160,20 @@ pub enum UninstallOutcome {
     NotPresent,
     NoFile,
 }
+
+/// What `gw doctor` finds at a given (agent, scope) location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    /// File at the integration path doesn't exist.
+    NoFile,
+    /// File exists but contains no gw integration.
+    NotInstalled,
+    /// File exists and contains a gw integration registered with the current
+    /// hook command / marker block.
+    Installed,
+    /// Claude Code only — integration registered with the legacy
+    /// `gw hook claude` command (early gw versions).  Still functional thanks
+    /// to the dispatcher alias, but `gw init --claude-code` will rewrite it on
+    /// next run.
+    InstalledLegacy,
+}

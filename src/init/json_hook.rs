@@ -11,7 +11,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::agent::{InstallOutcome, UninstallOutcome};
+use super::agent::{AgentStatus, InstallOutcome, UninstallOutcome};
 use super::consts::{
     CLAUDE_EVENT, CLAUDE_HOOK_COMMAND, CLAUDE_HOOK_COMMAND_LEGACY, CLAUDE_MATCHER,
 };
@@ -22,6 +22,49 @@ use super::settings::{ensure_object, read_json_or_empty, write_json_with_backup}
 // ============================================================================
 
 const CLAUDE_HOOK_COMMANDS: &[&str] = &[CLAUDE_HOOK_COMMAND, CLAUDE_HOOK_COMMAND_LEGACY];
+
+pub fn status_claude(path: &Path) -> Result<AgentStatus> {
+    if !path.exists() {
+        return Ok(AgentStatus::NoFile);
+    }
+    let value = ensure_object(read_json_or_empty(path)?);
+    Ok(claude_status(&value))
+}
+
+fn claude_status(value: &Value) -> AgentStatus {
+    let arr = match value
+        .get("hooks")
+        .and_then(|v| v.get(CLAUDE_EVENT))
+        .and_then(|v| v.as_array())
+    {
+        Some(a) => a,
+        None => return AgentStatus::NotInstalled,
+    };
+    let mut found_legacy = false;
+    for entry in arr {
+        if entry.get("matcher").and_then(|v| v.as_str()) != Some(CLAUDE_MATCHER) {
+            continue;
+        }
+        let inner = match entry.get("hooks").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for h in inner {
+            let cmd = h.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if cmd == CLAUDE_HOOK_COMMAND {
+                return AgentStatus::Installed;
+            }
+            if cmd == CLAUDE_HOOK_COMMAND_LEGACY {
+                found_legacy = true;
+            }
+        }
+    }
+    if found_legacy {
+        AgentStatus::InstalledLegacy
+    } else {
+        AgentStatus::NotInstalled
+    }
+}
 
 pub fn install_claude(path: &Path) -> Result<InstallOutcome> {
     let mut value = ensure_object(read_json_or_empty(path)?);
@@ -138,6 +181,18 @@ fn claude_remove_hook(value: &mut Value) -> bool {
 const GEMINI_EVENT: &str = "BeforeTool";
 const GEMINI_HOOK_COMMAND: &str = "gw hook gemini-cli";
 
+pub fn status_gemini(path: &Path) -> Result<AgentStatus> {
+    if !path.exists() {
+        return Ok(AgentStatus::NoFile);
+    }
+    let value = ensure_object(read_json_or_empty(path)?);
+    if gemini_has_hook(&value) {
+        Ok(AgentStatus::Installed)
+    } else {
+        Ok(AgentStatus::NotInstalled)
+    }
+}
+
 pub fn install_gemini(path: &Path) -> Result<InstallOutcome> {
     let mut value = ensure_object(read_json_or_empty(path)?);
     if gemini_has_hook(&value) {
@@ -224,6 +279,18 @@ fn gemini_remove_hook(value: &mut Value) -> bool {
 const CURSOR_EVENT: &str = "beforeShellExecution";
 const CURSOR_HOOK_COMMAND: &str = "gw hook cursor";
 const CURSOR_SCHEMA: &str = "https://unpkg.com/cursor-hooks@latest/schema/hooks.schema.json";
+
+pub fn status_cursor(path: &Path) -> Result<AgentStatus> {
+    if !path.exists() {
+        return Ok(AgentStatus::NoFile);
+    }
+    let value = ensure_object(read_json_or_empty(path)?);
+    if cursor_has_hook(&value) {
+        Ok(AgentStatus::Installed)
+    } else {
+        Ok(AgentStatus::NotInstalled)
+    }
+}
 
 pub fn install_cursor(path: &Path) -> Result<InstallOutcome> {
     let mut value = ensure_object(read_json_or_empty(path)?);

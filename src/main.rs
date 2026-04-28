@@ -1,4 +1,5 @@
 mod cli;
+mod doctor;
 mod filter;
 mod gain;
 mod heartbeat;
@@ -51,6 +52,7 @@ fn real_main() -> Result<i32> {
             Ok(0)
         }
         Ok(Dispatch::Hook(name)) => hook::dispatch(&name),
+        Ok(Dispatch::Doctor) => doctor::run(),
         Ok(Dispatch::Gain(rest)) => match gain::parse_args(rest) {
             Ok(opts) => gain::run(opts),
             Err(msg) => {

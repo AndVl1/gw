@@ -131,6 +131,27 @@ gw uninstall --gemini-cli --cursor         # multiple agents at once
 gw uninstall --all --local                 # everything in this project
 ```
 
+### Audit (`gw doctor`)
+
+Read-only check of every supported agent at both global and local scope — useful when you're not sure whether the hook landed, or whether you're still on the legacy `gw hook claude` command.
+
+```bash
+gw doctor
+```
+
+```
+gw 0.3.0
+
+Claude Code:
+  ✓ global installed     /Users/me/.claude/settings.json
+  - local  no file       .claude/settings.local.json
+Gemini CLI:
+  ✗ global not installed /Users/me/.gemini/settings.json
+  ...
+```
+
+Glyphs: `✓` installed, `⚠` legacy command (re-run `gw init --claude-code` to migrate), `✗` file present but no gw hook, `-` no file.
+
 ## Usage
 
 Once `gw init` is run, Claude Code's `Bash` tool calls get auto-rewritten when the command contains `gradlew`:
