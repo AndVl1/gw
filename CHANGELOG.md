@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.5](https://github.com/AndVl1/gw/compare/v0.2.4...v0.2.5) - 2026-04-28
+
+### Added
+
+- *(init)* add gw doctor audit command
+- *(heartbeat)* add task progress count and slow-task indicator
+- *(init)* support 10 agent targets with multi-target install
+- install scripts (sh/ps1), Windows builds, Linuxbrew, winget
+
+### Other
+
+- *(release-plz)* switch to git_only baseline
+- release v0.2.4
+- add release-plz for auto version-bump PRs
+
 ## [0.2.4](https://github.com/AndVl1/gw/compare/v0.2.0...v0.2.4) - 2026-04-28
 
 ### Added
