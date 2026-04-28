@@ -1,0 +1,11 @@
+# release-plz config — opens version-bump PR per push to main, creates the
+# vX.Y.Z tag when the PR is merged.  The tag triggers cd.yml which does the
+# actual binary builds, GH release upload, Homebrew/winget updates.
+
+[workspace]
+# gw is a binary, not a published crate.
+publish = false
+# cd.yml owns GH release creation (it has the built artifacts to upload).
+git_release_enable = false
+# Binary crate — semver check is for libraries.
+semver_check = false

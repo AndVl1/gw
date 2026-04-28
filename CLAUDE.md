@@ -42,53 +42,53 @@ CI on push/PR: fmt + clippy + test on `ubuntu-latest`, `macos-latest`.
 
 ## Release Flow
 
-Tag-driven via `cargo-release` locally + reusable CI workflow.
+Two-stage: `release-plz` opens a version-bump PR from Conventional Commits, then a tag-driven CD pipeline builds the binaries.
 
 ```
-local: cargo release <bump> --execute
-  → bumps Cargo.toml + Cargo.lock
-  → commits "chore(release): vX.Y.Z"
-  → tags vX.Y.Z
-  → pushes commit + tag to origin
+push to main → release-plz.yml
+  → release-plz-pr job: opens/updates "chore: release vX.Y.Z" PR
+       (bumps Cargo.toml + Cargo.lock, regenerates CHANGELOG.md from
+        commits since last tag)
+  → review/squash-merge the PR
 
-remote: push of tag v* triggers cd.yml
-  → calls reusable release.yml
+after merge → release-plz.yml runs again
+  → release-plz-release job: pushes vX.Y.Z tag (using PAT so it triggers
+    downstream workflows)
+
+tag push → cd.yml → release.yml
   → builds 4 targets, uploads tarballs + sha256 + checksums
   → softprops/action-gh-release creates GH release with auto-generated notes
   → homebrew job rewrites Formula/gw.rb in AndVl1/homebrew-tap
+  → winget-releaser opens update PR in microsoft/winget-pkgs
 ```
 
 ### Cutting a release
 
-```bash
-# Patch bump (0.2.0 → 0.2.1) — bug fixes only
-cargo release patch --execute
+Normal path: just merge to main with Conventional Commit messages. The release-plz PR appears automatically and accumulates commits until you merge it. Bump level is computed from commit types (`feat:` → minor, `fix:`/`perf:` → patch, `feat!:`/`BREAKING CHANGE:` → major post-1.0, minor pre-1.0).
 
-# Minor bump (0.2.0 → 0.3.0) — new features
-cargo release minor --execute
-
-# Specific version
-cargo release 0.5.0 --execute
-
-# Dry-run first if unsure (drop --execute)
-cargo release patch
+```
+gh pr list --label "release-plz"   # check current bump candidate
+gh pr merge <N> --squash            # ship it
 ```
 
-Pre-flight: `cargo-release` runs `cargo test` + checks branch/clean state. Aborts if dirty or off main.
+### Manual fallback (cargo-release)
 
-### Manual fallback
-
-If `cargo-release` is unavailable: bump `Cargo.toml` version manually, commit, tag, push:
+If you need to cut a release without going through release-plz (hotfix, weekend ops, GH Actions outage), `cargo-release` is still configured via `release.toml`:
 
 ```bash
-git tag v0.2.1 && git push origin v0.2.1
+cargo release patch --execute       # 0.2.4 → 0.2.5
+cargo release minor --execute       # 0.2.4 → 0.3.0
+cargo release 0.5.0 --execute       # explicit version
 ```
 
-Or trigger `release.yml` via `workflow_dispatch` with explicit tag input.
+Bumps `Cargo.toml`+`Cargo.lock`, commits `chore(release): vX.Y.Z`, tags, pushes. Pre-flight checks: `cargo test`, clean tree, on main. Tag push still triggers cd.yml.
+
+Last-resort fallback: bump version in `Cargo.toml` by hand, commit, `git tag v0.2.1 && git push origin v0.2.1`. Or run `release.yml` via `workflow_dispatch` with explicit tag input.
 
 ### Required secrets
 
-- `TAP_GITHUB_TOKEN` — PAT with write to `AndVl1/homebrew-tap`
+- `RELEASE_PLZ_TOKEN` — PAT (fine-grained: contents=read+write, pull-requests=read+write on `AndVl1/gw`). Used by release-plz-action both to open PRs and to push the release tag. **Must be a PAT, not GITHUB_TOKEN** — tags pushed by GITHUB_TOKEN don't trigger downstream workflows, so cd.yml would never fire.
+- `TAP_GITHUB_TOKEN` — PAT with write to `AndVl1/homebrew-tap`.
 - `WINGET_GITHUB_TOKEN` — classic PAT with `public_repo` scope. Used by `vedantmgoyal9/winget-releaser` to fork `microsoft/winget-pkgs` and open update PR.
 
 ### Winget bootstrap (one-time)
@@ -104,17 +104,19 @@ wingetcreate new <url-to-zip-asset>
 
 After first manifest lands in `microsoft/winget-pkgs`, every release tag auto-PRs an update.
 
-### Versioning rules (manual judgment, no longer auto)
+### Versioning rules
 
-- `fix:` only → patch
-- `feat:` → minor
-- Breaking change → minor pre-1.0, major post-1.0
+release-plz computes the bump from Conventional Commits in the release PR's range:
 
-Pick bump level by reading `git log v<last>..HEAD --oneline` before running `cargo release`.
+- `fix:` / `perf:` only → patch
+- any `feat:` → minor
+- `feat!:` / `fix!:` / `BREAKING CHANGE:` footer → minor pre-1.0, major post-1.0
+
+If the manual fallback is used, pick the same level by reading `git log v<last>..HEAD --oneline` before running `cargo release <bump>`.
 
 ## Commit Convention
 
-Conventional Commits. Required — release-please reads them.
+Conventional Commits. Required — release-plz reads them.
 
 ```
 <type>(<scope>)?: <subject>
