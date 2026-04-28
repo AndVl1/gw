@@ -3,10 +3,13 @@
 # actual binary builds, GH release upload, Homebrew/winget updates.
 
 [workspace]
-# gw is a binary CLI; we don't publish to crates.io. `git_only` makes
-# release-plz use git tags (not the stale 0.2.0 entry on crates.io) as the
-# baseline for version computation. It also suppresses `cargo publish` —
-# do NOT also set `publish = false`, the two flags are mutually exclusive.
+# gw is a binary CLI. Two settings are needed to fully detach from crates.io:
+#   - `publish = false`     — skip `cargo publish` on release
+#   - `git_only = true`     — read the previous release from git tags, not
+#                             from the stale 0.2.0 entry on crates.io
+# Only the combination `git_only = true && publish = true` is rejected; the
+# pair below is allowed and is what binary-only crates need.
+publish = false
 git_only = true
 # cd.yml owns GH release creation (it has the built artifacts to upload).
 git_release_enable = false

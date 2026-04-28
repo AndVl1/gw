@@ -14,6 +14,7 @@
 - *(release-plz)* switch to git_only baseline
 - release v0.2.4
 - add release-plz for auto version-bump PRs
+- Merge pull request #5 from AndVl1/feat/install-scripts-winget-linuxbrew
 
 ## [0.2.4](https://github.com/AndVl1/gw/compare/v0.2.0...v0.2.4) - 2026-04-28
 
