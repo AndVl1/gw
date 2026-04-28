@@ -19,9 +19,21 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
-use super::agent::{InstallOutcome, UninstallOutcome};
+use super::agent::{AgentStatus, InstallOutcome, UninstallOutcome};
 use super::consts::{MARKER_BEGIN, MARKER_END};
 use super::settings::{read_text_or_empty, write_text_with_backup};
+
+pub fn status(path: &Path) -> Result<AgentStatus> {
+    if !path.exists() {
+        return Ok(AgentStatus::NoFile);
+    }
+    let content = read_text_or_empty(path)?;
+    if find_block(&content).is_some() {
+        Ok(AgentStatus::Installed)
+    } else {
+        Ok(AgentStatus::NotInstalled)
+    }
+}
 
 pub fn install(path: &Path, body: &str) -> Result<InstallOutcome> {
     let existing = read_text_or_empty(path)?;

@@ -4,7 +4,7 @@ Wraps `./gradlew` (and any wrapper around it: `./mainframer ./gradlew`, `ssh hos
 
 - **Forwards**: errors (Kotlin `e:`, Java `error:`, Lint), failure blocks, test failures with stacktraces, `BUILD SUCCESSFUL` / `BUILD FAILED`.
 - **Suppresses**: daemon noise, dependency downloads, `> Task :foo` lines, `> Configure project`, deprecation banners, passing tests.
-- **Heartbeat** on stderr every ~3s (`▸ :app:compileKotlin (45s)`) so agents see the build is alive.
+- **Heartbeat** on stderr every ~3s (`▸ :app:compileKotlin (45s) [12 tasks]`) showing the active task, age, cumulative task progress, and a `— slow` marker once a single task exceeds `GW_HEARTBEAT_SLOW_SECS` (default 60s).
 - **Final summary** on stderr with task counts, test counts, error/warning totals, full-log path.
 - **Full log** preserved at `./build-logs/gw-<timestamp>.log` for drill-down.
 
@@ -130,6 +130,27 @@ gw uninstall                               # Claude Code, global
 gw uninstall --gemini-cli --cursor         # multiple agents at once
 gw uninstall --all --local                 # everything in this project
 ```
+
+### Audit (`gw doctor`)
+
+Read-only check of every supported agent at both global and local scope — useful when you're not sure whether the hook landed, or whether you're still on the legacy `gw hook claude` command.
+
+```bash
+gw doctor
+```
+
+```
+gw 0.3.0
+
+Claude Code:
+  ✓ global installed     /Users/me/.claude/settings.json
+  - local  no file       .claude/settings.local.json
+Gemini CLI:
+  ✗ global not installed /Users/me/.gemini/settings.json
+  ...
+```
+
+Glyphs: `✓` installed, `⚠` legacy command (re-run `gw init --claude-code` to migrate), `✗` file present but no gw hook, `-` no file.
 
 ## Usage
 

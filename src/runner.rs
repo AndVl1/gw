@@ -74,9 +74,14 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30);
+        let slow_secs = std::env::var("GW_HEARTBEAT_SLOW_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60);
         Some(Heartbeat::start(
             std::time::Duration::from_secs(secs),
             std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(slow_secs),
         ))
     } else {
         None
@@ -109,6 +114,7 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
         let decision = processor.process(&line);
         if let Some(hb) = &heartbeat {
             hb.set_task(processor.current_task.clone());
+            hb.set_progress(processor.progress_count);
         }
         if matches!(decision, Decision::Forward) {
             lines_forwarded += 1;

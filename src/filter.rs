@@ -43,6 +43,10 @@ pub struct Processor {
     state: State,
     pub stats: Stats,
     pub current_task: Option<String>,
+    /// Cumulative count of task lifecycle events seen — every `> Task :foo`
+    /// (start) and every terminal status (UP-TO-DATE / FROM-CACHE / SKIPPED /
+    /// NO-SOURCE / FAILED).  Surfaced in heartbeat as a progress signal.
+    pub progress_count: u32,
     pub mode: Mode,
 }
 
@@ -61,6 +65,7 @@ impl Processor {
             state: State::Normal,
             stats: Stats::default(),
             current_task: None,
+            progress_count: 0,
             mode,
         }
     }
@@ -102,9 +107,11 @@ impl Processor {
             }
             LineKind::TaskStart { name } => {
                 self.current_task = Some(name);
+                self.progress_count = self.progress_count.saturating_add(1);
                 Decision::Suppress
             }
             LineKind::TaskTerminal { status, name } => {
+                self.progress_count = self.progress_count.saturating_add(1);
                 match status.as_str() {
                     "UP-TO-DATE" => self.stats.tasks_up_to_date += 1,
                     "FROM-CACHE" => self.stats.tasks_from_cache += 1,
@@ -252,6 +259,21 @@ mod tests {
         p.process("> Task :app:compileKotlin UP-TO-DATE");
         assert_eq!(p.current_task, None);
         assert_eq!(p.stats.tasks_up_to_date, 1);
+    }
+
+    #[test]
+    fn progress_count_increments_on_task_lifecycle() {
+        let mut p = Processor::new(Mode::Default);
+        assert_eq!(p.progress_count, 0);
+        p.process("> Task :app:compileKotlin");
+        assert_eq!(p.progress_count, 1);
+        p.process("> Task :app:test UP-TO-DATE");
+        assert_eq!(p.progress_count, 2);
+        p.process("> Task :app:assemble FROM-CACHE");
+        assert_eq!(p.progress_count, 3);
+        // Non-task line must not bump.
+        p.process("Some other output");
+        assert_eq!(p.progress_count, 3);
     }
 
     #[test]

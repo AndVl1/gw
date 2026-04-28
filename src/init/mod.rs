@@ -8,7 +8,7 @@ pub mod settings;
 use anyhow::Result;
 use std::path::Path;
 
-pub use agent::{Agent, InstallOutcome, IntegrationKind, Scope, UninstallOutcome};
+pub use agent::{Agent, AgentStatus, InstallOutcome, IntegrationKind, Scope, UninstallOutcome};
 use consts::{RULE_BODY, RULE_BODY_HOOK_NOTE};
 
 /// Install gw integration for the given agent at the given scope.
@@ -63,6 +63,23 @@ pub fn uninstall(agent: Agent, scope: Scope) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Inspect the integration state for `(agent, scope)` without modifying anything.
+///
+/// Returns `Ok(None)` if the agent does not support the requested scope.
+pub fn status_at(agent: Agent, scope: Scope) -> Result<Option<AgentStatus>> {
+    let Some(path) = agent.path(scope) else {
+        return Ok(None);
+    };
+    let status = match agent.kind() {
+        IntegrationKind::ClaudeHook => json_hook::status_claude(&path)?,
+        IntegrationKind::GeminiHook => json_hook::status_gemini(&path)?,
+        IntegrationKind::CursorHook => json_hook::status_cursor(&path)?,
+        IntegrationKind::OpencodePlugin => opencode::status(&path)?,
+        IntegrationKind::RulesAppend => rules::status(&path)?,
+    };
+    Ok(Some(status))
 }
 
 fn install_at(agent: Agent, path: &Path) -> Result<InstallOutcome> {

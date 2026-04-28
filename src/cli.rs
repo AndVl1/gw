@@ -32,7 +32,7 @@ pub struct Cli {
     #[arg(long)]
     pub warnings: bool,
 
-    /// Subcommand or command to run (init, uninstall, hook, rewrite, gain, or any external command)
+    /// Subcommand or command to run (init, uninstall, doctor, hook, rewrite, gain, or any external command)
     #[arg(required = true)]
     pub args: Vec<String>,
 }
@@ -44,6 +44,7 @@ pub enum Dispatch<'a> {
     Hook(String),
     Rewrite(&'a [String]),
     Gain(&'a [String]),
+    Doctor,
     External(&'a [String]),
 }
 
@@ -59,6 +60,13 @@ pub fn dispatch<'a>(args: &'a [String]) -> Result<Dispatch<'a>, String> {
         },
         Some("rewrite") => Ok(Dispatch::Rewrite(&args[1..])),
         Some("gain") => Ok(Dispatch::Gain(&args[1..])),
+        Some("doctor") => {
+            if args.len() > 1 {
+                Err("gw doctor: takes no arguments".into())
+            } else {
+                Ok(Dispatch::Doctor)
+            }
+        }
         _ => Ok(Dispatch::External(args)),
     }
 }
@@ -189,6 +197,15 @@ mod tests {
     fn hook_requires_name() {
         let args = s(&["hook"]);
         assert!(dispatch(&args).is_err());
+    }
+
+    #[test]
+    fn doctor_takes_no_args() {
+        match dispatch(&s(&["doctor"])).unwrap() {
+            Dispatch::Doctor => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(dispatch(&s(&["doctor", "--all"])).is_err());
     }
 
     #[test]
