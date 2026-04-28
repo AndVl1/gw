@@ -245,6 +245,11 @@ jobs:
           TAG="${{ inputs.tag }}"
           echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
       - name: Submit to winget-pkgs
+        # Updates an existing manifest. The first version of `AndVl1.gw`
+        # must be bootstrapped via .github/workflows/winget-bootstrap.yml
+        # (manual `workflow_dispatch`) — until that PR lands in
+        # microsoft/winget-pkgs, this step fails and is allowed to.
+        continue-on-error: true
         uses: vedantmgoyal9/winget-releaser@main
         with:
           identifier: AndVl1.gw

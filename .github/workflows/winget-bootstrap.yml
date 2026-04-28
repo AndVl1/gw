@@ -1,0 +1,124 @@
+name: Winget bootstrap
+
+# One-shot manual workflow: builds the three winget manifests for the
+# given release tag and submits them as a fresh PR to microsoft/winget-pkgs
+# via wingetcreate.  Use this exactly once, when AndVl1.gw is not yet
+# present in the winget catalog.  Subsequent releases are handled by the
+# update step in release.yml (vedantmgoyal9/winget-releaser).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.2.5)'
+        required: true
+        default: 'v0.2.5'
+
+jobs:
+  bootstrap:
+    runs-on: windows-latest
+    steps:
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch installer SHA256s
+        id: sums
+        shell: bash
+        run: |
+          TAG="${{ steps.v.outputs.tag }}"
+          VER="${{ steps.v.outputs.version }}"
+          BASE="https://github.com/AndVl1/gw/releases/download/$TAG"
+          for arch in x86_64 aarch64; do
+            asset="gw-$VER-${arch}-pc-windows-msvc.zip"
+            curl -sSfL "$BASE/$asset.sha256" -o "$asset.sha256"
+            sha=$(awk '{print toupper($1)}' "$asset.sha256")
+            echo "${arch}_sha=$sha" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Write manifests
+        shell: bash
+        run: |
+          VER="${{ steps.v.outputs.version }}"
+          TAG="${{ steps.v.outputs.tag }}"
+          X64_SHA="${{ steps.sums.outputs.x86_64_sha }}"
+          ARM64_SHA="${{ steps.sums.outputs.aarch64_sha }}"
+          BASE="https://github.com/AndVl1/gw/releases/download/$TAG"
+          OUT="manifests/a/AndVl1/gw/$VER"
+          mkdir -p "$OUT"
+
+          cat > "$OUT/AndVl1.gw.yaml" <<EOF
+          PackageIdentifier: AndVl1.gw
+          PackageVersion: $VER
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.6.0
+          EOF
+
+          cat > "$OUT/AndVl1.gw.locale.en-US.yaml" <<EOF
+          PackageIdentifier: AndVl1.gw
+          PackageVersion: $VER
+          PackageLocale: en-US
+          Publisher: AndVl1
+          PublisherUrl: https://github.com/AndVl1
+          PublisherSupportUrl: https://github.com/AndVl1/gw/issues
+          PackageName: gw
+          PackageUrl: https://github.com/AndVl1/gw
+          License: MIT
+          LicenseUrl: https://github.com/AndVl1/gw/blob/main/LICENSE
+          ShortDescription: Gradle output filter for AI coding agents.
+          Description: |
+            gw wraps ./gradlew, strips noise (daemon banners, downloads, task lifecycle, deprecations),
+            forwards errors/warnings/status, prints a heartbeat, and saves the full log on disk.
+          Tags:
+            - gradle
+            - kotlin
+            - cli
+          ManifestType: defaultLocale
+          ManifestVersion: 1.6.0
+          EOF
+
+          cat > "$OUT/AndVl1.gw.installer.yaml" <<EOF
+          PackageIdentifier: AndVl1.gw
+          PackageVersion: $VER
+          InstallerType: zip
+          NestedInstallerType: portable
+          NestedInstallerFiles:
+            - RelativeFilePath: gw.exe
+              PortableCommandAlias: gw
+          Commands:
+            - gw
+          Installers:
+            - Architecture: x64
+              InstallerUrl: $BASE/gw-$VER-x86_64-pc-windows-msvc.zip
+              InstallerSha256: $X64_SHA
+            - Architecture: arm64
+              InstallerUrl: $BASE/gw-$VER-aarch64-pc-windows-msvc.zip
+              InstallerSha256: $ARM64_SHA
+          ManifestType: installer
+          ManifestVersion: 1.6.0
+          EOF
+
+          echo "--- Generated manifests ---"
+          ls "$OUT"
+          for f in "$OUT"/*.yaml; do
+            echo "=== $f ==="
+            cat "$f"
+          done
+
+      - name: Install wingetcreate
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+
+      - name: Submit to microsoft/winget-pkgs
+        shell: pwsh
+        env:
+          WINGET_PAT: ${{ secrets.WINGET_GITHUB_TOKEN }}
+        run: |
+          $ver = "${{ steps.v.outputs.version }}"
+          .\wingetcreate.exe submit "manifests\a\AndVl1\gw\$ver" --token $env:WINGET_PAT
