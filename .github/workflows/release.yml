@@ -100,6 +100,15 @@ jobs:
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.zip").Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+          # Create winget-specific archive (files in root, no subdirectory)
+          $wingetDir = "dist/${name}-winget"
+          New-Item -ItemType Directory -Force -Path $wingetDir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/gw.exe" "$wingetDir/"
+          if (Test-Path "README.md") { Copy-Item "README.md" "$wingetDir/" }
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$wingetDir/" }
+          Compress-Archive -Path "$wingetDir\*" -DestinationPath "dist/$name-winget.zip"
+          $wingetHash = (Get-FileHash -Algorithm SHA256 "dist/$name-winget.zip").Hash.ToLower()
+          "$wingetHash  $name-winget.zip" | Out-File -Encoding ascii "dist/$name-winget.zip.sha256"
         env:
           TAG: ${{ inputs.tag }}
       - uses: actions/upload-artifact@v4
@@ -109,6 +118,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.sha256
+          if-no-files-found: error
 
   release:
     name: Publish release
@@ -254,5 +264,5 @@ jobs:
         with:
           identifier: AndVl1.gw
           version: ${{ steps.version.outputs.value }}
-          installers-regex: '\.zip$'
+          installers-regex: '.*-winget\.zip$'
           token: ${{ secrets.WINGET_GITHUB_TOKEN }}
