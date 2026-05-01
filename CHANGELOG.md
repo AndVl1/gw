@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.6](https://github.com/AndVl1/gw/compare/v0.2.5...v0.2.6) - 2026-05-01
+
+### Added
+
+- *(release)* add winget-specific archives
+
+### Other
+
+- *(winget)* add manual bootstrap workflow + tolerate first-run failure
+
 ## [0.2.5](https://github.com/AndVl1/gw/compare/v0.2.4...v0.2.5) - 2026-04-28
 
 ### Added
