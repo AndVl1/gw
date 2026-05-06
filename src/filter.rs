@@ -29,6 +29,29 @@ pub enum Decision {
 /// never emitted (e.g. the process was killed mid-output).
 const FAILURE_BLOCK_MAX_LINES: usize = 200;
 
+/// Leaf names of Gradle tasks whose output is informational rather than
+/// build/diagnostic noise (e.g. `gradlew tasks` lists every task).  Match is
+/// done on the last `:` segment, so `:tasks` and `:app:tasks` both qualify.
+const INFORMATIONAL_TASK_LEAVES: &[&str] = &[
+    "tasks",
+    "dependencies",
+    "dependencyInsight",
+    "projects",
+    "help",
+    "properties",
+    "buildEnvironment",
+    "javaToolchains",
+    "outgoingVariants",
+    "resolvableConfigurations",
+    "model",
+    "components",
+];
+
+fn is_informational_task(name: &str) -> bool {
+    let leaf = name.rsplit(':').next().unwrap_or("");
+    INFORMATIONAL_TASK_LEAVES.contains(&leaf)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Normal,
@@ -37,6 +60,10 @@ enum State {
     /// never emitted.
     InFailureBlock(usize),
     InErrorContinuation(usize),
+    /// Inside an informational Gradle task (`:tasks`, `:dependencies`, …).
+    /// Forward every `Other`/`Blank`/`Indented` line until the next task
+    /// boundary or build terminator.
+    InInformationalTask,
 }
 
 pub struct Processor {
@@ -80,7 +107,9 @@ impl Processor {
             }
             LineKind::KotlinWarning | LineKind::JavaWarning | LineKind::LintWarning => {
                 self.stats.warnings += 1;
-                self.state = State::Normal;
+                if !matches!(self.state, State::InInformationalTask) {
+                    self.state = State::Normal;
+                }
                 if self.mode == Mode::WithWarnings {
                     Decision::Forward
                 } else {
@@ -106,12 +135,23 @@ impl Processor {
                 Decision::Suppress
             }
             LineKind::TaskStart { name } => {
-                self.current_task = Some(name);
                 self.progress_count = self.progress_count.saturating_add(1);
+                if is_informational_task(&name) {
+                    self.current_task = Some(name);
+                    self.state = State::InInformationalTask;
+                    return Decision::Forward;
+                }
+                if matches!(self.state, State::InInformationalTask) {
+                    self.state = State::Normal;
+                }
+                self.current_task = Some(name);
                 Decision::Suppress
             }
             LineKind::TaskTerminal { status, name } => {
                 self.progress_count = self.progress_count.saturating_add(1);
+                if matches!(self.state, State::InInformationalTask) {
+                    self.state = State::Normal;
+                }
                 match status.as_str() {
                     "UP-TO-DATE" => self.stats.tasks_up_to_date += 1,
                     "FROM-CACHE" => self.stats.tasks_from_cache += 1,
@@ -161,6 +201,7 @@ impl Processor {
                     self.state = State::InErrorContinuation(n - 1);
                     Decision::Forward
                 }
+                State::InInformationalTask => Decision::Forward,
                 _ => Decision::Suppress,
             },
             LineKind::Blank => match self.state {
@@ -172,6 +213,7 @@ impl Processor {
                     self.state = State::Normal;
                     Decision::Suppress
                 }
+                State::InInformationalTask => Decision::Forward,
                 _ => {
                     self.state = State::Normal;
                     Decision::Suppress
@@ -190,6 +232,7 @@ impl Processor {
                     self.state = State::Normal;
                     Decision::Suppress
                 }
+                State::InInformationalTask => Decision::Forward,
                 _ => Decision::Suppress,
             },
         }
@@ -350,6 +393,79 @@ mod tests {
             Decision::Suppress
         );
         assert_eq!(p.process("Download https://repo/foo"), Decision::Suppress);
+    }
+
+    #[test]
+    fn informational_task_forwards_listing() {
+        let mut p = Processor::new(Mode::Default);
+        // Header line is forwarded.
+        assert_eq!(p.process("> Task :tasks"), Decision::Forward);
+        // Configuration phase prefix would have been suppressed before this; now
+        // we're inside the informational block — content lines pass through.
+        assert_eq!(
+            p.process("------------------------------------------------------------"),
+            Decision::Forward
+        );
+        assert_eq!(p.process(""), Decision::Forward);
+        assert_eq!(p.process("Build tasks"), Decision::Forward);
+        assert_eq!(p.process("-----------"), Decision::Forward);
+        assert_eq!(
+            p.process("assemble - Assembles the outputs of this project."),
+            Decision::Forward
+        );
+        // Build terminator exits the block and is itself forwarded.
+        assert_eq!(p.process("BUILD SUCCESSFUL in 1s"), Decision::Forward);
+        // After the terminator, normal suppression resumes.
+        assert_eq!(p.process("trailing noise"), Decision::Suppress);
+    }
+
+    #[test]
+    fn informational_task_recognises_subproject() {
+        let mut p = Processor::new(Mode::Default);
+        assert_eq!(p.process("> Task :app:dependencies"), Decision::Forward);
+        assert_eq!(p.process("compileClasspath - ..."), Decision::Forward);
+        assert_eq!(p.process("BUILD SUCCESSFUL in 1s"), Decision::Forward);
+    }
+
+    #[test]
+    fn informational_block_exits_on_next_task() {
+        let mut p = Processor::new(Mode::Default);
+        assert_eq!(p.process("> Task :tasks"), Decision::Forward);
+        assert_eq!(p.process("Some listing"), Decision::Forward);
+        // Non-informational task starts — exits the block, line suppressed as
+        // usual for task starts.
+        assert_eq!(p.process("> Task :app:compileKotlin"), Decision::Suppress);
+        // Subsequent generic lines are suppressed again.
+        assert_eq!(p.process("not in info anymore"), Decision::Suppress);
+    }
+
+    #[test]
+    fn informational_block_does_not_swallow_errors() {
+        let mut p = Processor::new(Mode::Default);
+        assert_eq!(p.process("> Task :tasks"), Decision::Forward);
+        assert_eq!(
+            p.process("e: /a/Foo.kt:1:1 Unresolved reference"),
+            Decision::Forward
+        );
+        assert_eq!(p.stats.errors, 1);
+    }
+
+    #[test]
+    fn configuration_phase_still_suppressed() {
+        // Configure lines precede the first task and must keep being dropped
+        // even when an informational task follows later.
+        let mut p = Processor::new(Mode::Default);
+        assert_eq!(p.process("> Configure project :app"), Decision::Suppress);
+        assert_eq!(p.process("> Task :tasks"), Decision::Forward);
+    }
+
+    #[test]
+    fn non_informational_leaf_not_passthrough() {
+        // `:taskschedule` ends with `taskschedule`, not `tasks` — must not be
+        // treated as informational.
+        let mut p = Processor::new(Mode::Default);
+        assert_eq!(p.process("> Task :app:taskschedule"), Decision::Suppress);
+        assert_eq!(p.process("some output"), Decision::Suppress);
     }
 
     #[test]

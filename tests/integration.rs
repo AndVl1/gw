@@ -116,6 +116,38 @@ fn filters_failed_build() {
 }
 
 #[test]
+fn forwards_informational_task_listing() {
+    let path = fixture("sample-tasks.txt");
+    let (code, stdout, _) = run_gw(&["--no-log", "--no-heartbeat", "cat", path.to_str().unwrap()]);
+    assert_eq!(code, 0);
+
+    // Listing body must reach the user.
+    assert!(
+        stdout.contains("Build tasks"),
+        "section header missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("assemble - Assembles the outputs of this project."),
+        "task description missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("To see all tasks and more detail, run gradlew tasks --all"),
+        "tail line missing: {stdout}"
+    );
+    assert!(stdout.contains("BUILD SUCCESSFUL"), "build line missing");
+
+    // Configuration phase + daemon noise must still be filtered.
+    assert!(
+        !stdout.contains("Starting a Gradle Daemon"),
+        "daemon noise leaked: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Configure project"),
+        "configure phase leaked: {stdout}"
+    );
+}
+
+#[test]
 fn rewrite_subcommand_handles_gradle_invocations() {
     let (code, stdout, _) = run_gw(&["rewrite", "./gradlew", "assemble"]);
     assert_eq!(code, 0);
