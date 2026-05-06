@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.7](https://github.com/AndVl1/gw/compare/v0.2.6...v0.2.7) - 2026-05-06
+
+### Added
+
+- *(runner)* handle wrapper-command output corruption
+
 ## [0.2.6](https://github.com/AndVl1/gw/compare/v0.2.5...v0.2.6) - 2026-05-01
 
 ### Added
