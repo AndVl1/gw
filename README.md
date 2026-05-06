@@ -172,7 +172,17 @@ gw --quiet ./gradlew test               # errors only
 gw --warnings ./gradlew build           # also stream warnings
 gw --no-heartbeat ./gradlew lint        # no progress lines on stderr
 gw --no-log ./gradlew test              # do not write build-logs/ file
+gw --no-console-plain ./gradlew build   # don't auto-inject --console=plain
 ```
+
+By default `gw` injects `--console=plain` into the Gradle invocation
+(detected by the `gradle`/`gradlew`/`gradle.bat` basename, even when
+nested under a wrapper such as `./mainframer.sh ./gradlew …`). This
+keeps output deterministic when the build runs without a real PTY (over
+SSH, on CI, inside a remote-builder wrapper) — without it, ANSI cursor
+moves and progress redraws can corrupt parsing and tty layout. Pass
+`--no-console-plain` to opt out, or set `--console=...` yourself and gw
+will leave it alone.
 
 The exit code matches the wrapped command's exit code.
 

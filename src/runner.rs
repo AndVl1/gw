@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -17,6 +17,44 @@ pub struct RunOptions {
     pub write_log: bool,
     pub log_dir: Option<String>,
     pub mode: Mode,
+}
+
+/// Inject `--console=plain` into a command line if it looks like a Gradle
+/// invocation and the user hasn't already specified a `--console=` value.
+///
+/// Why: wrapper commands (mainframer, ssh, custom shells) don't allocate a
+/// real PTY for the remote process, but Gradle's auto-detection still
+/// sometimes emits rich/ANSI output anyway. The escape sequences corrupt
+/// our line-based parser (`BUILD FAILED` ends up after a cursor-move
+/// sequence and the anchored regex misses it) and break terminal layout.
+/// Forcing plain console makes the output deterministic.
+///
+/// Detection looks at the basename of each argument: matches when one of
+/// them is `gradle`, `gradlew`, or `gradle.bat` (with any path prefix).
+/// The flag is inserted right after the matched argument so it lands on
+/// the gradle command itself, not on an outer wrapper.
+pub fn inject_console_plain(args: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = args.to_vec();
+    if out.iter().any(|a| has_console_flag(a)) {
+        return out;
+    }
+    if let Some(idx) = out.iter().position(|a| is_gradle_invocation(a)) {
+        out.insert(idx + 1, "--console=plain".to_string());
+    }
+    out
+}
+
+fn is_gradle_invocation(arg: &str) -> bool {
+    let trimmed = arg.trim_end_matches('/');
+    let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    matches!(
+        basename,
+        "gradle" | "gradlew" | "gradle.bat" | "gradlew.bat"
+    )
+}
+
+fn has_console_flag(arg: &str) -> bool {
+    arg == "--console" || arg.starts_with("--console=")
 }
 
 pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
@@ -89,6 +127,14 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
 
     let mut processor = Processor::new(opts.mode);
     let stdout_h = std::io::stdout();
+    // CRLF only when stdout is a terminal — pipes/files keep plain LF so
+    // downstream tools (grep, jq, files committed to git) aren't littered
+    // with stray carriage returns.
+    let line_ending: &[u8] = if stdout_h.is_terminal() {
+        b"\r\n"
+    } else {
+        b"\n"
+    };
 
     // Track whether we already warned about a failing log write so we don't
     // spam the user on every subsequent line.
@@ -121,9 +167,17 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
             bytes_forwarded += line.len() as u64 + 1;
             // Lock per-line so the heartbeat thread can interleave stdout
             // writes; pre-locking the handle would deadlock the heartbeat.
+            //
+            // Use explicit CRLF: child wrappers (ssh, mainframer) sometimes
+            // leave the controlling tty in raw/-onlcr mode, so a bare `\n`
+            // moves cursor down without returning to column 0 — output then
+            // cascades right with each forwarded line. Writing `\r\n` is
+            // safe in cooked mode too (ONLCR translates `\n` only and won't
+            // double the CR).
             {
                 let mut out = stdout_h.lock();
-                let _ = writeln!(out, "{}", line);
+                let _ = out.write_all(line.as_bytes());
+                let _ = out.write_all(line_ending);
                 let _ = out.flush();
             }
             if let Some(hb) = &heartbeat {
@@ -223,8 +277,16 @@ fn pipe_lines<R: std::io::Read + Send + 'static>(reader: R, tx: mpsc::Sender<Str
             Ok(l) => l,
             Err(_) => break,
         };
-        if tx.send(line).is_err() {
-            break;
+        // Some wrappers (ssh, mainframer, gradle progress bars) emit `\r`
+        // mid-line to overwrite a previous status. BufReader::lines only
+        // splits on `\n`, so those carriage returns end up embedded in the
+        // forwarded line — corrupting terminal output and bypassing
+        // anchored regexes like `^BUILD FAILED`. Treat each `\r`-separated
+        // segment as its own logical line.
+        for segment in line.split('\r') {
+            if tx.send(segment.to_string()).is_err() {
+                return;
+            }
         }
     }
 }
@@ -249,4 +311,73 @@ fn exit_code(status: ExitStatus) -> i32 {
             1
         }
     })
+}
+
+#[cfg(test)]
+mod inject_console_plain_tests {
+    use super::*;
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn injects_after_plain_gradlew() {
+        let out = inject_console_plain(&s(&["./gradlew", "assemble"]));
+        assert_eq!(out, s(&["./gradlew", "--console=plain", "assemble"]));
+    }
+
+    #[test]
+    fn injects_after_gradlew_in_wrapper_chain() {
+        let out = inject_console_plain(&s(&["./mainframer.sh", "./gradlew", "build"]));
+        assert_eq!(
+            out,
+            s(&["./mainframer.sh", "./gradlew", "--console=plain", "build"])
+        );
+    }
+
+    #[test]
+    fn injects_with_absolute_path() {
+        let out = inject_console_plain(&s(&["/usr/local/bin/gradle", "test"]));
+        assert_eq!(
+            out,
+            s(&["/usr/local/bin/gradle", "--console=plain", "test"])
+        );
+    }
+
+    #[test]
+    fn windows_basename_matched() {
+        let out = inject_console_plain(&s(&["C:\\proj\\gradlew.bat", "build"]));
+        assert_eq!(
+            out,
+            s(&["C:\\proj\\gradlew.bat", "--console=plain", "build"])
+        );
+    }
+
+    #[test]
+    fn skips_when_user_set_console_flag() {
+        let out = inject_console_plain(&s(&["./gradlew", "--console=rich", "assemble"]));
+        assert_eq!(out, s(&["./gradlew", "--console=rich", "assemble"]));
+    }
+
+    #[test]
+    fn skips_when_user_set_console_flag_with_space() {
+        // Gradle accepts both `--console=plain` and `--console plain`.
+        let out = inject_console_plain(&s(&["./gradlew", "--console", "plain", "assemble"]));
+        assert_eq!(out, s(&["./gradlew", "--console", "plain", "assemble"]));
+    }
+
+    #[test]
+    fn no_op_for_non_gradle_command() {
+        let out = inject_console_plain(&s(&["cargo", "build"]));
+        assert_eq!(out, s(&["cargo", "build"]));
+    }
+
+    #[test]
+    fn no_op_for_arg_containing_gradle_substring() {
+        // "my-gradle-helper" should NOT match — only a basename of `gradle`
+        // (no suffix) is recognised.
+        let out = inject_console_plain(&s(&["./my-gradle-helper", "go"]));
+        assert_eq!(out, s(&["./my-gradle-helper", "go"]));
+    }
 }
