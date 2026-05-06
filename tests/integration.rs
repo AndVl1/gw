@@ -471,3 +471,173 @@ fn init_cline_global_warns_and_skips() {
         "expected scope-skip warning on stderr, got: {stderr}"
     );
 }
+
+/// Reproduces wrapper-command bugs (mainframer, ssh, custom shells):
+/// child output occasionally embeds bare `\r` mid-line (terminal cursor
+/// reset) which BufReader::lines does NOT split. Before the fix:
+///   1. `BUILD FAILED` line preceded by `\r`-prefixed garbage failed to
+///      classify (`^BUILD FAILED` regex) → summary said "no status reported".
+///   2. Forwarded line still contained the `\r`, so terminals rendered
+///      cascading offsets when ONLCR was disabled by the wrapper.
+#[test]
+fn forwards_cr_split_segments_as_separate_lines() {
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    // Three error lines, two of them joined by mid-line `\r` (as ssh / a
+    // progress-bar layer might emit when overwriting).
+    tmp.write_all(
+        b"e: /a/Foo.kt:10:5 first error\rstale progress\n\
+          e: /a/Foo.kt:20:5 second error\re: /a/Foo.kt:30:5 third error\n",
+    )
+    .unwrap();
+    let path = tmp.path().to_path_buf();
+    let (_code, stdout, _stderr) =
+        run_gw(&["--no-log", "--no-heartbeat", "cat", path.to_str().unwrap()]);
+    assert!(
+        stdout.contains("first error"),
+        "first error missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("second error"),
+        "second error missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("third error"),
+        "third error not split out from CR-joined segment: {stdout}"
+    );
+    // No bare `\r` in forwarded payload — would corrupt terminal layout.
+    assert!(
+        !stdout.contains('\r'),
+        "stdout still contains bare `\\r`: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn classifies_build_failed_when_preceded_by_cr_chunk() {
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    // Wrapper emits a transient progress segment then BUILD FAILED on the
+    // same physical line (\r between them). Before the fix the whole line
+    // was treated as `progress message\rBUILD FAILED in 11s` and the
+    // anchored `^BUILD FAILED` regex failed.
+    tmp.write_all(
+        b"transient progress message\rBUILD FAILED in 11s\n\
+          5427 actionable tasks: 1 executed, 5426 up-to-date\n",
+    )
+    .unwrap();
+    let path = tmp.path().to_path_buf();
+    let (_code, stdout, stderr) =
+        run_gw(&["--no-log", "--no-heartbeat", "cat", path.to_str().unwrap()]);
+    assert!(
+        stdout.contains("BUILD FAILED in 11s"),
+        "BUILD FAILED line not forwarded: {stdout}"
+    );
+    assert!(
+        stderr.contains("BUILD FAILED") && !stderr.contains("no status reported"),
+        "summary should say BUILD FAILED, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("5426 up-to-date"),
+        "task stats missing from summary: {stderr}"
+    );
+}
+
+#[test]
+fn forwards_lines_to_pipe_with_plain_lf() {
+    // When stdout is NOT a tty, gw should keep plain LF — emitting CRLF
+    // would litter pipes / files committed to git with stray `\r`.
+    let path = fixture("sample-failure.txt");
+    let (_, stdout, _) = run_gw(&["--no-log", "--no-heartbeat", "cat", path.to_str().unwrap()]);
+    assert!(
+        !stdout.contains('\r'),
+        "pipe output must use LF only, found CR: {:?}",
+        stdout
+    );
+}
+
+/// Smoke test with the full mainframer-shaped fixture: errors, FAILURE
+/// block, BUILD FAILED, task summary, plus wrapper noise (sync, connection
+/// notices). Verifies the summary is correct end-to-end.
+#[test]
+fn mainframer_wrapped_failure_summary_is_correct() {
+    let path = fixture("sample-mainframer.txt");
+    let (_, stdout, stderr) =
+        run_gw(&["--no-log", "--no-heartbeat", "cat", path.to_str().unwrap()]);
+    assert!(stdout.contains("FAILURE: Build failed"), "missing FAILURE");
+    assert!(
+        stdout.contains("BUILD FAILED in 11s"),
+        "missing BUILD FAILED"
+    );
+    assert!(
+        stderr.contains("BUILD FAILED") && !stderr.contains("no status reported"),
+        "summary wrong: {stderr}"
+    );
+    assert!(stderr.contains("3 errors"), "error count wrong: {stderr}");
+    assert!(
+        stderr.contains("5426 up-to-date"),
+        "task stats missing: {stderr}"
+    );
+}
+
+/// Integration check: spawning gw with a fake gradlew script must result
+/// in `--console=plain` reaching the child argv. We run a tiny shell
+/// wrapper named `gradlew` that echoes its received args, then assert the
+/// flag appears.
+#[cfg(unix)]
+#[test]
+fn injects_console_plain_into_gradle_invocation() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gradlew");
+    {
+        let mut f = std::fs::File::create(&script).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "echo ARGS: \"$@\"").unwrap();
+        writeln!(f, "echo BUILD SUCCESSFUL in 1s").unwrap();
+    }
+    let mut perm = std::fs::metadata(&script).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&script, perm).unwrap();
+
+    let (_, stdout, _) = run_gw(&["--full", script.to_str().unwrap(), "assemble"]);
+    assert!(
+        stdout.contains("ARGS: --console=plain assemble"),
+        "expected --console=plain injected, got: {stdout}"
+    );
+}
+
+/// `--no-console-plain` opts out of injection.
+#[cfg(unix)]
+#[test]
+fn no_console_plain_disables_injection() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gradlew");
+    {
+        let mut f = std::fs::File::create(&script).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "echo ARGS: \"$@\"").unwrap();
+        writeln!(f, "echo BUILD SUCCESSFUL in 1s").unwrap();
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(&script).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&script, perm).unwrap();
+
+    let (_, stdout, _) = run_gw(&[
+        "--full",
+        "--no-console-plain",
+        script.to_str().unwrap(),
+        "assemble",
+    ]);
+    assert!(
+        stdout.contains("ARGS: assemble"),
+        "expected raw argv, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("--console=plain"),
+        "console flag should NOT be injected: {stdout}"
+    );
+}

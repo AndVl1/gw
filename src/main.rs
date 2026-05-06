@@ -92,7 +92,12 @@ fn real_main() -> Result<i32> {
                     Mode::Default
                 },
             };
-            runner::run(cmd, opts)
+            let cmd = if cli.no_console_plain {
+                cmd.to_vec()
+            } else {
+                runner::inject_console_plain(cmd)
+            };
+            runner::run(&cmd, opts)
         }
     }
 }

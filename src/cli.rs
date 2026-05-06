@@ -32,6 +32,12 @@ pub struct Cli {
     #[arg(long)]
     pub warnings: bool,
 
+    /// Don't auto-inject `--console=plain` into Gradle invocations.
+    /// gw injects it by default so wrapper commands (mainframer, ssh) don't
+    /// produce ANSI/cursor-control escapes that corrupt parsing and tty layout.
+    #[arg(long)]
+    pub no_console_plain: bool,
+
     /// Subcommand or command to run (init, uninstall, doctor, hook, rewrite, gain, or any external command)
     #[arg(required = true)]
     pub args: Vec<String>,
