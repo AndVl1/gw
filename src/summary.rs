@@ -2,14 +2,23 @@ use crate::filter::Stats;
 use std::io::{Result, Write};
 use std::path::Path;
 
-pub fn print<W: Write>(stats: &Stats, log_path: Option<&Path>, out: &mut W) -> Result<()> {
+pub fn print<W: Write>(
+    stats: &Stats,
+    log_path: Option<&Path>,
+    exit_code: Option<i32>,
+    out: &mut W,
+) -> Result<()> {
     writeln!(out, "─────────────────────────────────────")?;
-    let status = if stats.build_failed {
-        "BUILD FAILED"
+    let status: String = if stats.build_failed {
+        "BUILD FAILED".into()
     } else if stats.build_success {
-        "BUILD SUCCESSFUL"
+        "BUILD SUCCESSFUL".into()
     } else {
-        "BUILD ENDED (no status reported)"
+        match exit_code {
+            Some(0) => "BUILD SUCCESSFUL (no status line)".into(),
+            Some(c) => format!("BUILD FAILED (exit {c})"),
+            None => "BUILD ENDED (no status reported)".into(),
+        }
     };
     writeln!(out, "{status}")?;
 
@@ -81,11 +90,38 @@ mod tests {
             ..Stats::default()
         };
         let mut buf = Vec::new();
-        print(&stats, None, &mut buf).unwrap();
+        print(&stats, None, Some(0), &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("BUILD SUCCESSFUL"));
         assert!(s.contains("5 executed"));
         assert!(s.contains("10 up-to-date"));
         assert!(s.contains("2 warnings"));
+    }
+
+    #[test]
+    fn falls_back_to_exit_zero_as_success() {
+        let stats = Stats::default();
+        let mut buf = Vec::new();
+        print(&stats, None, Some(0), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("BUILD SUCCESSFUL (no status line)"), "{s}");
+    }
+
+    #[test]
+    fn falls_back_to_exit_nonzero_as_failed() {
+        let stats = Stats::default();
+        let mut buf = Vec::new();
+        print(&stats, None, Some(1), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("BUILD FAILED (exit 1)"), "{s}");
+    }
+
+    #[test]
+    fn unknown_exit_keeps_legacy_message() {
+        let stats = Stats::default();
+        let mut buf = Vec::new();
+        print(&stats, None, None, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("BUILD ENDED (no status reported)"), "{s}");
     }
 }
