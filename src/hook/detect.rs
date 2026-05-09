@@ -7,53 +7,46 @@ static ENV_PREFIX: Lazy<Regex> = Lazy::new(|| {
     )
     .unwrap()
 });
-static GRADLEW: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bgradlew\b").unwrap());
 static ALREADY_WRAPPED: Lazy<Regex> = Lazy::new(|| Regex::new(r"^gw\s").unwrap());
 
-/// Commands whose quoted arguments should be treated as runnable shell code,
-/// so we do NOT strip quoted segments when checking for `gradlew` inside them.
-const SHELL_LIKE: &[&str] = &["ssh", "bash", "sh", "zsh", "fish"];
-
-/// Extract the bare command name (first token after any env-var assignments).
-fn command_name(cmd: &str) -> Option<String> {
-    let stripped = ENV_PREFIX.replace(cmd, "").into_owned();
-    let first = stripped.split_whitespace().next()?.to_string();
-    // Strip leading path components so `./gradlew` → `gradlew`.
-    let bare = first
-        .trim_start_matches("./")
-        .trim_start_matches('/')
-        .to_string();
-    Some(bare)
+/// Strip surrounding `'`/`"` and leading path components, return the bare
+/// executable name (e.g. `'./gradlew` → `gradlew`, `/usr/bin/foo` → `foo`).
+fn bare_token(token: &str) -> &str {
+    let t = token.trim_matches(|c| c == '"' || c == '\'');
+    let t = t.trim_start_matches("./");
+    match t.rfind('/') {
+        Some(i) => &t[i + 1..],
+        None => t,
+    }
 }
 
-/// Remove all single- and double-quoted segments from `s`.
-/// Used to strip quoted string literals so the `gradlew` word-boundary check
-/// does not trigger on e.g. `echo "gradlew"`.
-fn strip_quoted(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                // Skip until closing double-quote (no escape handling needed for
-                // our purpose — we only care about word presence).
-                for inner in chars.by_ref() {
-                    if inner == '"' {
-                        break;
-                    }
-                }
-            }
-            '\'' => {
-                for inner in chars.by_ref() {
-                    if inner == '\'' {
-                        break;
-                    }
-                }
-            }
-            other => out.push(other),
+/// True iff `seg` invokes `gradlew` as a runnable command — either directly
+/// (`./gradlew assemble`) or via a wrapper binary that takes a *path* to
+/// gradlew as its argument (`mainframer ./gradlew test`,
+/// `bash -c './gradlew test'`, `ssh host './gradlew test'`).
+///
+/// Plain bareword matches like `grep gradlew`, `pgrep gradlew`,
+/// `find . -name gradlew`, or `echo "gradlew"` do NOT count: gradlew there
+/// is data, not an executable. The path requirement (`./`, `/`, `../`
+/// prefix) is what filters those out.
+fn segment_invokes_gradlew(seg: &str) -> bool {
+    let stripped = ENV_PREFIX.replace(seg.trim_start(), "").into_owned();
+    let mut tokens = stripped.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if bare_token(first) == "gradlew" {
+        return true;
+    }
+    for t in tokens {
+        let cleaned = t.trim_matches(|c| c == '"' || c == '\'');
+        let looks_like_path =
+            cleaned.starts_with("./") || cleaned.starts_with('/') || cleaned.starts_with("../");
+        if looks_like_path && bare_token(cleaned) == "gradlew" {
+            return true;
         }
     }
-    out
+    false
 }
 
 /// Split a shell command line into (segment, separator-after) pairs at
@@ -135,23 +128,11 @@ fn rewrite_segment(seg: &str) -> Option<String> {
         return None;
     }
     let leading = &seg[..seg.len() - trimmed.len()];
-    let stripped = ENV_PREFIX.replace(trimmed, "");
+    let stripped = ENV_PREFIX.replace(trimmed, "").into_owned();
     if ALREADY_WRAPPED.is_match(&stripped) {
         return None;
     }
-
-    let haystack: String;
-    let search_in: &str = if command_name(&stripped)
-        .map(|n| SHELL_LIKE.contains(&n.as_str()))
-        .unwrap_or(false)
-    {
-        &stripped
-    } else {
-        haystack = strip_quoted(&stripped);
-        &haystack
-    };
-
-    if !GRADLEW.is_match(search_in) {
+    if !segment_invokes_gradlew(&stripped) {
         return None;
     }
     Some(format!("{}gw {}", leading, trimmed))
@@ -247,7 +228,6 @@ mod tests {
 
     #[test]
     fn ignores_gradlew_in_double_quotes() {
-        // `echo "gradlew"` must NOT be rewritten — the word is only in a literal string.
         assert!(detect_rewrite(r#"echo "gradlew""#).is_none());
     }
 
@@ -258,7 +238,6 @@ mod tests {
 
     #[test]
     fn rewrites_bash_with_quoted_gradlew() {
-        // bash/sh/zsh treat the quoted argument as code — must still wrap.
         let result = detect_rewrite("bash -c './gradlew test'");
         assert!(
             result.is_some(),
@@ -268,7 +247,6 @@ mod tests {
 
     #[test]
     fn ignores_cat_with_quoted_gradlew_bat() {
-        // `cat 'gradlew.bat'` — gradlew is inside a quote for a non-shell command.
         assert!(detect_rewrite("cat 'gradlew.bat'").is_none());
     }
 
@@ -326,7 +304,6 @@ mod tests {
 
     #[test]
     fn does_not_split_inside_single_quotes() {
-        // `;` inside ssh's quoted command must not split — whole thing is one segment.
         assert_eq!(
             detect_rewrite("ssh host './gradlew a; ./gradlew b'").as_deref(),
             Some("gw ssh host './gradlew a; ./gradlew b'")
@@ -343,7 +320,6 @@ mod tests {
 
     #[test]
     fn handles_pipe_separator() {
-        // Pipe: only left segment matches; right (`tee`) untouched.
         assert_eq!(
             detect_rewrite("./gradlew test | tee log.txt").as_deref(),
             Some("gw ./gradlew test | tee log.txt")
@@ -355,6 +331,48 @@ mod tests {
         assert_eq!(
             detect_rewrite("./gradlew --stop & ./gradlew test").as_deref(),
             Some("gw ./gradlew --stop & gw ./gradlew test")
+        );
+    }
+
+    // Bareword false-positive regressions ─────────────────────────────────────
+
+    #[test]
+    fn ignores_ssh_grep_for_gradlew_pattern() {
+        // The pipes are inside the SSH-quoted arg, so they belong to the
+        // remote shell. Locally this is a single segment whose command is
+        // `ssh`, and `gradlew` only appears as a grep pattern (no path
+        // prefix) — must NOT wrap.
+        assert!(detect_rewrite(r#"ssh abuild "ps aux | grep gradlew | grep -v grep""#).is_none());
+    }
+
+    #[test]
+    fn ignores_top_level_grep_for_gradlew_pattern() {
+        assert!(detect_rewrite("ps aux | grep gradlew | grep -v grep").is_none());
+    }
+
+    #[test]
+    fn ignores_pgrep_gradlew() {
+        assert!(detect_rewrite("pgrep gradlew").is_none());
+    }
+
+    #[test]
+    fn ignores_find_name_gradlew() {
+        assert!(detect_rewrite("find . -name gradlew").is_none());
+    }
+
+    #[test]
+    fn rewrites_absolute_path_to_gradlew() {
+        assert_eq!(
+            detect_rewrite("/repo/proj/gradlew assemble").as_deref(),
+            Some("gw /repo/proj/gradlew assemble")
+        );
+    }
+
+    #[test]
+    fn rewrites_parent_relative_path_to_gradlew() {
+        assert_eq!(
+            detect_rewrite("../proj/gradlew assemble").as_deref(),
+            Some("gw ../proj/gradlew assemble")
         );
     }
 }
