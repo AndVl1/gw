@@ -198,13 +198,14 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
     let log_path = log.as_ref().map(|l| l.path().to_path_buf());
     drop(log);
 
+    let code = exit_code(status);
     summary::print(
         &processor.stats,
         log_path.as_deref(),
+        Some(code),
         &mut std::io::stderr().lock(),
     )?;
 
-    let code = exit_code(status);
     let run = stats::Run {
         ts: chrono::Utc::now().timestamp(),
         cmd: cmd_label(args),
