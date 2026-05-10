@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.9](https://github.com/AndVl1/gw/compare/v0.2.8...v0.2.9) - 2026-05-10
+
+### Fixed
+
+- *(summary)* fall back to child exit code when no status line seen
+- *(hook)* require gradlew in command position, not as bareword arg
+
 ## [0.2.8](https://github.com/AndVl1/gw/compare/v0.2.7...v0.2.8) - 2026-05-06
 
 ### Fixed
