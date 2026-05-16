@@ -22,6 +22,8 @@ When running Gradle, always wrap with `gw`:
 - `./gradlew assembleDebug` (avoid — full noisy log floods the context)
 
 `gw` filters Gradle output (~70% token reduction). Same exit codes. Errors, warnings, and BUILD SUCCESSFUL/FAILED are preserved verbatim. A heartbeat line prints every 30 s during silent stretches so you know the build is alive.
+
+**Do not pipe `gw` through `tail`, `head`, or similar truncators.** The output is already filtered: a reflexive `| tail -n 80` will drop the leading error/stacktrace and leave you with only the trailing summary. Read the full `gw` output directly.
 "#;
 
 /// Body for hook-based agents (Claude/Gemini/Cursor) — short note that
@@ -31,4 +33,6 @@ pub const RULE_BODY_HOOK_NOTE: &str = r#"## Build Commands (managed by gw — au
 Gradle commands are automatically wrapped with `gw` via the configured PreToolUse hook — no manual action needed.
 
 `gw` filters Gradle output (~70% token reduction): errors, warnings, status lines preserved verbatim; daemon noise, downloads, configure phase, and per-task lines are dropped. Heartbeat fires every 30 s during silent stretches.
+
+**Do not pipe `gw` through `tail`, `head`, or similar truncators.** The output is already filtered: a reflexive `| tail -n 80` will drop the leading error/stacktrace and leave you with only the trailing summary. Read the full `gw` output directly.
 "#;
