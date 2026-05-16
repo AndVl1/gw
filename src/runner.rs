@@ -140,8 +140,13 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
     // the stream is filtered, not the raw build. Printed once, before any
     // child output reaches stdout. Second line nudges automation agents not
     // to truncate already-trimmed output with `| tail -n N`.
+    //
+    // We deliberately don't surface the build-logs path here: it would
+    // invite an agent to cat the raw file instead of waiting for the
+    // (intentionally filtered) stream. The path is still printed in the
+    // final summary on stderr, where humans can find it post-run.
     {
-        let banner = banner_line(opts.mode, log.as_ref().map(|l| l.path()));
+        let banner = banner_line(opts.mode);
         let mut out = stdout_h.lock();
         let _ = out.write_all(banner.as_bytes());
         let _ = out.write_all(line_ending);
@@ -274,17 +279,13 @@ fn record_passthrough(args: &[String], started: Instant, code: i32) {
 const BANNER_NOTRUNCATE: &str =
     "▸ gw: output is pre-filtered — do not pipe through tail/head, you will lose signal";
 
-fn banner_line(mode: Mode, log_path: Option<&std::path::Path>) -> String {
+fn banner_line(mode: Mode) -> String {
     let forwarded = match mode {
         Mode::Quiet => "errors only",
         Mode::Default => "errors and build status",
         Mode::WithWarnings => "errors, warnings, and build status",
     };
-    let mut s = format!("▸ gw: build starting — forwarding {forwarded}");
-    if let Some(p) = log_path {
-        s.push_str(&format!("; full log at {}", p.display()));
-    }
-    s
+    format!("▸ gw: build starting — forwarding {forwarded}")
 }
 
 fn cmd_label(args: &[String]) -> String {
@@ -347,32 +348,33 @@ fn exit_code(status: ExitStatus) -> i32 {
 #[cfg(test)]
 mod banner_tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn default_mode_mentions_errors_and_status() {
-        let b = banner_line(Mode::Default, None);
+        let b = banner_line(Mode::Default);
         assert!(b.starts_with("▸ gw: build starting"), "{b}");
         assert!(b.contains("errors and build status"), "{b}");
-        assert!(!b.contains("full log"), "{b}");
     }
 
     #[test]
     fn with_warnings_mentions_warnings() {
-        let b = banner_line(Mode::WithWarnings, None);
+        let b = banner_line(Mode::WithWarnings);
         assert!(b.contains("warnings"), "{b}");
     }
 
     #[test]
     fn quiet_mentions_errors_only() {
-        let b = banner_line(Mode::Quiet, None);
+        let b = banner_line(Mode::Quiet);
         assert!(b.contains("errors only"), "{b}");
     }
 
     #[test]
-    fn appends_log_path_when_present() {
-        let b = banner_line(Mode::Default, Some(Path::new("build-logs/gw-x.log")));
-        assert!(b.contains("full log at build-logs/gw-x.log"), "{b}");
+    fn never_advertises_log_path() {
+        // Surfacing the build-logs path here invites agents to read the raw
+        // file instead of waiting for the filtered stream. Path stays in the
+        // summary on stderr only.
+        let b = banner_line(Mode::Default);
+        assert!(!b.to_lowercase().contains("log"), "{b}");
     }
 }
 
