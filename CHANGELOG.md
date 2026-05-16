@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.11](https://github.com/AndVl1/gw/compare/v0.2.10...v0.2.11) - 2026-05-16
+
+### Added
+
+- *(runner)* drop log-path hint from startup banner
+
 ## [0.2.10](https://github.com/AndVl1/gw/compare/v0.2.9...v0.2.10) - 2026-05-16
 
 ### Added
