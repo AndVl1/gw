@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.10](https://github.com/AndVl1/gw/compare/v0.2.9...v0.2.10) - 2026-05-16
+
+### Added
+
+- *(runner,init)* warn agents not to truncate pre-filtered output
+- *(runner)* print startup banner before forwarding output
+
 ## [0.2.9](https://github.com/AndVl1/gw/compare/v0.2.8...v0.2.9) - 2026-05-10
 
 ### Fixed
