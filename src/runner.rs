@@ -136,6 +136,17 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
         b"\n"
     };
 
+    // Up-front disclaimer so the user (or a pasted log) immediately sees that
+    // the stream is filtered, not the raw build. Printed once, before any
+    // child output reaches stdout.
+    {
+        let banner = banner_line(opts.mode, log.as_ref().map(|l| l.path()));
+        let mut out = stdout_h.lock();
+        let _ = out.write_all(banner.as_bytes());
+        let _ = out.write_all(line_ending);
+        let _ = out.flush();
+    }
+
     // Track whether we already warned about a failing log write so we don't
     // spam the user on every subsequent line.
     let mut log_failed = false;
@@ -257,6 +268,19 @@ fn record_passthrough(args: &[String], started: Instant, code: i32) {
     let _ = stats::append(&run);
 }
 
+fn banner_line(mode: Mode, log_path: Option<&std::path::Path>) -> String {
+    let forwarded = match mode {
+        Mode::Quiet => "errors only",
+        Mode::Default => "errors and build status",
+        Mode::WithWarnings => "errors, warnings, and build status",
+    };
+    let mut s = format!("▸ gw: build starting — forwarding {forwarded}");
+    if let Some(p) = log_path {
+        s.push_str(&format!("; full log at {}", p.display()));
+    }
+    s
+}
+
 fn cmd_label(args: &[String]) -> String {
     args.iter().take(5).cloned().collect::<Vec<_>>().join(" ")
 }
@@ -312,6 +336,38 @@ fn exit_code(status: ExitStatus) -> i32 {
             1
         }
     })
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn default_mode_mentions_errors_and_status() {
+        let b = banner_line(Mode::Default, None);
+        assert!(b.starts_with("▸ gw: build starting"), "{b}");
+        assert!(b.contains("errors and build status"), "{b}");
+        assert!(!b.contains("full log"), "{b}");
+    }
+
+    #[test]
+    fn with_warnings_mentions_warnings() {
+        let b = banner_line(Mode::WithWarnings, None);
+        assert!(b.contains("warnings"), "{b}");
+    }
+
+    #[test]
+    fn quiet_mentions_errors_only() {
+        let b = banner_line(Mode::Quiet, None);
+        assert!(b.contains("errors only"), "{b}");
+    }
+
+    #[test]
+    fn appends_log_path_when_present() {
+        let b = banner_line(Mode::Default, Some(Path::new("build-logs/gw-x.log")));
+        assert!(b.contains("full log at build-logs/gw-x.log"), "{b}");
+    }
 }
 
 #[cfg(test)]
