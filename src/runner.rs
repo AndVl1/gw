@@ -138,11 +138,14 @@ pub fn run(args: &[String], opts: RunOptions) -> Result<i32> {
 
     // Up-front disclaimer so the user (or a pasted log) immediately sees that
     // the stream is filtered, not the raw build. Printed once, before any
-    // child output reaches stdout.
+    // child output reaches stdout. Second line nudges automation agents not
+    // to truncate already-trimmed output with `| tail -n N`.
     {
         let banner = banner_line(opts.mode, log.as_ref().map(|l| l.path()));
         let mut out = stdout_h.lock();
         let _ = out.write_all(banner.as_bytes());
+        let _ = out.write_all(line_ending);
+        let _ = out.write_all(BANNER_NOTRUNCATE.as_bytes());
         let _ = out.write_all(line_ending);
         let _ = out.flush();
     }
@@ -267,6 +270,9 @@ fn record_passthrough(args: &[String], started: Instant, code: i32) {
     };
     let _ = stats::append(&run);
 }
+
+const BANNER_NOTRUNCATE: &str =
+    "▸ gw: output is pre-filtered — do not pipe through tail/head, you will lose signal";
 
 fn banner_line(mode: Mode, log_path: Option<&std::path::Path>) -> String {
     let forwarded = match mode {
