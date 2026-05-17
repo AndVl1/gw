@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.12](https://github.com/AndVl1/gw/compare/v0.2.11...v0.2.12) - 2026-05-17
+
+### Added
+
+- *(cli)* add gw upgrade to re-apply installs and migrate layout
+- *(init)* use .claude/rules/gw.md for Claude Code instead of CLAUDE.md
+- *(hook)* warn when gradlew is piped through tail/head
+- *(init)* warn agents to propagate no-truncate rule to subagents
+
 ## [0.2.11](https://github.com/AndVl1/gw/compare/v0.2.10...v0.2.11) - 2026-05-16
 
 ### Added
