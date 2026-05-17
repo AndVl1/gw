@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::Read;
 
-use super::detect::detect_rewrite;
+use super::detect::{detect_rewrite, detect_truncation};
 
 pub fn run() -> Result<i32> {
     let mut raw = Vec::new();
@@ -32,12 +32,16 @@ pub fn run() -> Result<i32> {
         return Ok(0);
     };
 
+    let mut agent_msg =
+        format!("Wrap Gradle commands with gw to filter noisy output. Retry: {rewritten}");
+    if let Some(warn) = detect_truncation(cmd) {
+        agent_msg.push_str("\nWarning: ");
+        agent_msg.push_str(warn);
+    }
     let out = json!({
         "continue": false,
         "permission": "deny",
-        "agentMessage": format!(
-            "Wrap Gradle commands with gw to filter noisy output. Retry: {rewritten}"
-        ),
+        "agentMessage": agent_msg,
         "userMessage": "gw filter requested rewrite"
     });
     println!("{}", out);

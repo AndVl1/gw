@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::Read;
 
-use super::detect::detect_rewrite;
+use super::detect::{detect_rewrite, detect_truncation};
 
 pub fn run() -> Result<i32> {
     let mut raw = Vec::new();
@@ -21,11 +21,16 @@ pub fn run() -> Result<i32> {
     let Some(rewritten) = detect_rewrite(cmd) else {
         return Ok(0);
     };
+    let mut reason = String::from("gw filter (auto-wrap gradlew)");
+    if let Some(warn) = detect_truncation(cmd) {
+        reason.push_str(" — warning: ");
+        reason.push_str(warn);
+    }
     let out = json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "permissionDecisionReason": "gw filter (auto-wrap gradlew)",
+            "permissionDecisionReason": reason,
             "updatedInput": { "command": rewritten }
         }
     });

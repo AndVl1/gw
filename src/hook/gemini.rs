@@ -12,7 +12,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::Read;
 
-use super::detect::detect_rewrite;
+use super::detect::{detect_rewrite, detect_truncation};
 
 pub fn run() -> Result<i32> {
     let mut raw = Vec::new();
@@ -31,11 +31,16 @@ pub fn run() -> Result<i32> {
     let Some(rewritten) = detect_rewrite(cmd) else {
         return Ok(0);
     };
+    let mut msg = String::from("gw filter (auto-wrap gradlew)");
+    if let Some(warn) = detect_truncation(cmd) {
+        msg.push_str(" — warning: ");
+        msg.push_str(warn);
+    }
     let out = json!({
         "decision": "allow",
         "continue": true,
         "tool_input": { "command": rewritten },
-        "systemMessage": "gw filter (auto-wrap gradlew)"
+        "systemMessage": msg
     });
     println!("{}", out);
     Ok(0)
