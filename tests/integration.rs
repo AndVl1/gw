@@ -484,6 +484,76 @@ fn init_multi_target_local() {
     assert!(dir.path().join(".clinerules").exists());
 }
 
+/// `gw init --claude-code --local` writes hook into settings.local.json AND
+/// drops the rule file at `.claude/rules/gw.md` (NOT into CLAUDE.md).
+#[test]
+fn init_claude_code_local_writes_rules_file_not_claude_md() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["init", "--claude-code", "--local"])
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw init");
+    assert_eq!(out.status.code(), Some(0));
+
+    // Hook registered.
+    let settings = dir.path().join(".claude/settings.local.json");
+    assert!(settings.exists());
+
+    // Rule file written at .claude/rules/gw.md (official Claude Code convention).
+    let rules = dir.path().join(".claude/rules/gw.md");
+    assert!(rules.exists(), "expected .claude/rules/gw.md to exist");
+    let content = std::fs::read_to_string(&rules).unwrap();
+    assert!(content.contains("auto-intercepted"));
+    assert!(content.contains("<!-- gw:begin -->"));
+
+    // CLAUDE.md must NOT be touched.
+    assert!(
+        !dir.path().join("CLAUDE.md").exists(),
+        "CLAUDE.md must not be created — gw owns its own rules file"
+    );
+}
+
+/// `gw init` after an older install that had written a marker block into
+/// CLAUDE.md: the legacy block is stripped, the new rules/gw.md is created.
+#[test]
+fn init_claude_code_migrates_legacy_claude_md_block() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let claude_md = dir.path().join("CLAUDE.md");
+    std::fs::write(
+        &claude_md,
+        "# Project rules\n\nUse strict types.\n\n<!-- gw:begin -->\n## Build Commands (managed by gw)\n\nold body\n<!-- gw:end -->\n",
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args(["init", "--claude-code", "--local"])
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw init");
+    assert_eq!(out.status.code(), Some(0));
+
+    // Legacy block stripped, user content preserved.
+    let after = std::fs::read_to_string(&claude_md).unwrap();
+    assert!(after.contains("Project rules"));
+    assert!(!after.contains("<!-- gw:begin -->"));
+    assert!(!after.contains("old body"));
+
+    // New rules file in place.
+    assert!(dir.path().join(".claude/rules/gw.md").exists());
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("migrated legacy block") || stderr.contains("migrated legacy block"),
+        "expected migration message, stdout: {stdout}, stderr: {stderr}"
+    );
+}
+
 /// Local-only agent with --global (default) scope warns and skips.
 #[test]
 fn init_cline_global_warns_and_skips() {

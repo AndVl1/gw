@@ -108,7 +108,7 @@ Per-agent integration mechanism:
 
 | Agent | Mechanism | Default file (global) | Local file |
 |---|---|---|---|
-| `claude-code` | PreToolUse hook + companion `CLAUDE.md` note | `~/.claude/settings.json` | `.claude/settings.local.json` |
+| `claude-code` | PreToolUse hook + rule file at `.claude/rules/gw.md` ([official rules dir](https://code.claude.com/docs/en/memory)) | `~/.claude/settings.json` | `.claude/settings.local.json` |
 | `gemini-cli` | BeforeTool hook + companion `GEMINI.md` note | `~/.gemini/settings.json` | `.gemini/settings.json` |
 | `cursor` | `beforeShellExecution` hook + `AGENTS.md` note | `~/.cursor/hooks.json` | `.cursor/hooks.json` |
 | `opencode` | TS plugin (`tool.execute.before`) shelling out to `gw rewrite` | `~/.config/opencode/plugin/gw.ts` | `.opencode/plugin/gw.ts` |

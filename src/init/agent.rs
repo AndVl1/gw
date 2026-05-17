@@ -131,14 +131,31 @@ impl Agent {
 
     /// Companion documentation file for hook-based agents — short note
     /// explaining auto-interception so the agent surfaces it in chat context.
+    ///
+    /// For Claude Code we use the official `.claude/rules/` directory rather
+    /// than appending a marker block to the user's `CLAUDE.md`. See
+    /// https://code.claude.com/docs/en/memory — `~/.claude/rules/*.md` is
+    /// loaded into every session (global), `.claude/rules/*.md` per project.
+    /// Owning a dedicated file keeps CLAUDE.md untouched.
     pub fn docs_path(self, scope: Scope) -> Option<PathBuf> {
         match (self, scope) {
-            (Agent::ClaudeCode, Scope::Global) => home(".claude/CLAUDE.md"),
-            (Agent::ClaudeCode, Scope::Local) => Some(PathBuf::from("CLAUDE.md")),
+            (Agent::ClaudeCode, Scope::Global) => home(".claude/rules/gw.md"),
+            (Agent::ClaudeCode, Scope::Local) => Some(PathBuf::from(".claude/rules/gw.md")),
             (Agent::GeminiCli, Scope::Global) => home(".gemini/GEMINI.md"),
             (Agent::GeminiCli, Scope::Local) => Some(PathBuf::from("GEMINI.md")),
             (Agent::Cursor, Scope::Local) => Some(PathBuf::from("AGENTS.md")),
             (Agent::Cursor, Scope::Global) => home(".cursor/AGENTS.md"),
+            _ => None,
+        }
+    }
+
+    /// Legacy companion path — earlier versions appended a marker block to
+    /// `CLAUDE.md` directly. `install` strips that block on upgrade so the
+    /// content doesn't appear twice.
+    pub fn legacy_docs_path(self, scope: Scope) -> Option<PathBuf> {
+        match (self, scope) {
+            (Agent::ClaudeCode, Scope::Global) => home(".claude/CLAUDE.md"),
+            (Agent::ClaudeCode, Scope::Local) => Some(PathBuf::from("CLAUDE.md")),
             _ => None,
         }
     }

@@ -13,9 +13,10 @@ use consts::{RULE_BODY, RULE_BODY_HOOK_NOTE};
 
 /// Install gw integration for the given agent at the given scope.
 ///
-/// For hook-based agents, also writes a short companion docs note (CLAUDE.md /
-/// GEMINI.md / AGENTS.md) so the agent surfaces "auto-intercepted via hooks"
-/// in its instructions context.
+/// For hook-based agents, also writes a short companion rule file
+/// (`.claude/rules/gw.md` for Claude Code, `GEMINI.md` for Gemini, `AGENTS.md`
+/// for Cursor) so the agent surfaces "auto-intercepted via hooks" in its
+/// instructions context.
 pub fn install(agent: Agent, scope: Scope) -> Result<()> {
     let Some(path) = agent.path(scope) else {
         eprintln!(
@@ -36,6 +37,14 @@ pub fn install(agent: Agent, scope: Scope) -> Result<()> {
                 println!("  + docs note: {}", docs_path.display());
             }
             InstallOutcome::AlreadyInstalled => {}
+        }
+    }
+
+    // Migrate older installs that wrote a marker block directly into
+    // CLAUDE.md before the .claude/rules/gw.md scheme existed.
+    if let Some(legacy_path) = agent.legacy_docs_path(scope) {
+        if let UninstallOutcome::Removed = rules::uninstall(&legacy_path)? {
+            println!("  ~ migrated legacy block out of {}", legacy_path.display());
         }
     }
     Ok(())
@@ -60,6 +69,13 @@ pub fn uninstall(agent: Agent, scope: Scope) -> Result<()> {
                 println!("  - docs note: {}", docs_path.display());
             }
             UninstallOutcome::NotPresent | UninstallOutcome::NoFile => {}
+        }
+    }
+
+    // Also clean up any legacy marker block from CLAUDE.md (older installs).
+    if let Some(legacy_path) = agent.legacy_docs_path(scope) {
+        if let UninstallOutcome::Removed = rules::uninstall(&legacy_path)? {
+            println!("  - legacy block: {}", legacy_path.display());
         }
     }
     Ok(())
