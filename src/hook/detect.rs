@@ -101,6 +101,9 @@ fn split_segments(cmd: &str) -> Vec<(String, String)> {
                 if chars.peek() == Some(&'&') {
                     chars.next();
                     segs.push((std::mem::take(&mut cur), "&&".to_string()));
+                } else if cur.ends_with('>') || chars.peek() == Some(&'>') {
+                    // Redirect form: `2>&1`, `>&2`, `&>file`. Keep `&` literal.
+                    cur.push(c);
                 } else {
                     segs.push((std::mem::take(&mut cur), "&".to_string()));
                 }
@@ -136,6 +139,35 @@ fn rewrite_segment(seg: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}gw {}", leading, trimmed))
+}
+
+/// Detect the pattern `./gradlew ... | tail|head ...` (and `&&`/`||`/`;` are
+/// fine — only a direct `|` from a gradlew segment counts as truncation of
+/// build output). Returns a fixed warning string if found, else `None`.
+///
+/// Only `tail` and `head` are flagged. Other filters (`grep`, `sed`, `awk`)
+/// have legitimate uses on gradle output (e.g. `| grep ERROR`) and would
+/// produce too many false positives.
+pub fn detect_truncation(command: &str) -> Option<&'static str> {
+    let segments = split_segments(command);
+    for i in 0..segments.len().saturating_sub(1) {
+        let (seg, sep) = &segments[i];
+        if sep != "|" {
+            continue;
+        }
+        if !segment_invokes_gradlew(seg.trim_start()) {
+            continue;
+        }
+        let next = segments[i + 1].0.trim_start();
+        let first = next.split_whitespace().next().unwrap_or("");
+        let bare = bare_token(first);
+        if bare == "tail" || bare == "head" {
+            return Some(
+                "gw output is already filtered — piping through tail/head drops the leading error/stacktrace. Re-run without the truncator and read the full output."
+            );
+        }
+    }
+    None
 }
 
 pub fn detect_rewrite(command: &str) -> Option<String> {
@@ -327,6 +359,15 @@ mod tests {
     }
 
     #[test]
+    fn does_not_split_on_redirect_ampersand() {
+        // `2>&1` is a redirect, not a background separator. Must not split.
+        assert_eq!(
+            detect_rewrite("./gradlew test 2>&1 | tee log.txt").as_deref(),
+            Some("gw ./gradlew test 2>&1 | tee log.txt")
+        );
+    }
+
+    #[test]
     fn handles_background_ampersand() {
         assert_eq!(
             detect_rewrite("./gradlew --stop & ./gradlew test").as_deref(),
@@ -374,5 +415,56 @@ mod tests {
             detect_rewrite("../proj/gradlew assemble").as_deref(),
             Some("gw ../proj/gradlew assemble")
         );
+    }
+
+    // Truncation detection ────────────────────────────────────────────────────
+
+    #[test]
+    fn flags_gradlew_piped_to_tail() {
+        assert!(detect_truncation("./gradlew test | tail -n 80").is_some());
+    }
+
+    #[test]
+    fn flags_gradlew_piped_to_head() {
+        assert!(detect_truncation("./gradlew test | head -n 50").is_some());
+    }
+
+    #[test]
+    fn flags_gradlew_with_redirect_then_tail() {
+        assert!(detect_truncation("./gradlew :app:assemble 2>&1 | tail -n 200").is_some());
+    }
+
+    #[test]
+    fn flags_tail_in_middle_of_chain() {
+        // `./gradlew clean && ./gradlew test | tail -n 50` — second gradlew piped to tail.
+        assert!(detect_truncation("./gradlew clean && ./gradlew test | tail -n 50").is_some());
+    }
+
+    #[test]
+    fn does_not_flag_grep_filter() {
+        assert!(detect_truncation("./gradlew test | grep ERROR").is_none());
+    }
+
+    #[test]
+    fn does_not_flag_tail_on_non_gradlew() {
+        assert!(detect_truncation("git log | tail -n 20").is_none());
+    }
+
+    #[test]
+    fn does_not_flag_plain_gradlew() {
+        assert!(detect_truncation("./gradlew test").is_none());
+    }
+
+    #[test]
+    fn does_not_flag_tail_after_semicolon() {
+        // Separate command, not piping gradlew output.
+        assert!(detect_truncation("./gradlew test; tail -n 10 build.log").is_none());
+    }
+
+    #[test]
+    fn does_not_flag_tail_inside_quoted_arg() {
+        // The `| tail` is inside the SSH-quoted arg — locally it's a single
+        // segment whose command is `ssh`, not gradlew.
+        assert!(detect_truncation(r#"ssh host "./gradlew test | tail -n 20""#).is_none());
     }
 }
