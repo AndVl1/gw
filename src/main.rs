@@ -10,6 +10,7 @@ mod parser;
 mod runner;
 mod stats;
 mod summary;
+mod upgrade;
 
 use anyhow::Result;
 use clap::Parser;
@@ -53,6 +54,7 @@ fn real_main() -> Result<i32> {
         }
         Ok(Dispatch::Hook(name)) => hook::dispatch(&name),
         Ok(Dispatch::Doctor) => doctor::run(),
+        Ok(Dispatch::Upgrade) => upgrade::run(),
         Ok(Dispatch::Gain(rest)) => match gain::parse_args(rest) {
             Ok(opts) => gain::run(opts),
             Err(msg) => {

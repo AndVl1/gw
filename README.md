@@ -108,7 +108,7 @@ Per-agent integration mechanism:
 
 | Agent | Mechanism | Default file (global) | Local file |
 |---|---|---|---|
-| `claude-code` | PreToolUse hook + companion `CLAUDE.md` note | `~/.claude/settings.json` | `.claude/settings.local.json` |
+| `claude-code` | PreToolUse hook + rule file at `.claude/rules/gw.md` ([official rules dir](https://code.claude.com/docs/en/memory)) | `~/.claude/settings.json` | `.claude/settings.local.json` |
 | `gemini-cli` | BeforeTool hook + companion `GEMINI.md` note | `~/.gemini/settings.json` | `.gemini/settings.json` |
 | `cursor` | `beforeShellExecution` hook + `AGENTS.md` note | `~/.cursor/hooks.json` | `.cursor/hooks.json` |
 | `opencode` | TS plugin (`tool.execute.before`) shelling out to `gw rewrite` | `~/.config/opencode/plugin/gw.ts` | `.opencode/plugin/gw.ts` |
@@ -151,6 +151,16 @@ Gemini CLI:
 ```
 
 Glyphs: `✓` installed, `⚠` legacy command (re-run `gw init --claude-code` to migrate), `✗` file present but no gw hook, `-` no file.
+
+### Upgrade (`gw upgrade`)
+
+Re-applies the install for every (agent, scope) pair that is already wired up, migrating the on-disk layout to the current scheme. Idempotent — if nothing has changed for that target, it's a no-op. Targets that were never installed stay untouched.
+
+```bash
+gw upgrade
+```
+
+Use this after updating `gw` itself to a version that changes integration layout (e.g. the move from a marker block in `CLAUDE.md` to a dedicated `.claude/rules/gw.md` file, or the legacy `gw hook claude` → `gw hook claude-code` command rename). Saves the dance of `gw uninstall --all --local && gw init --all --local` (which would also re-install agents you never wanted in the first place).
 
 ## Usage
 

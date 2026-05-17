@@ -29,7 +29,10 @@ When running Gradle, always wrap with `gw`:
 "#;
 
 /// Body for hook-based agents (Claude/Gemini/Cursor) — short note that
-/// interception is automatic. Saved to companion docs file (CLAUDE.md / GEMINI.md / AGENTS.md).
+/// interception is automatic. Saved to a dedicated file the agent loads at
+/// session start: `.claude/rules/gw.md` (Claude Code, project or user scope —
+/// see https://code.claude.com/docs/en/memory), `GEMINI.md` (Gemini CLI),
+/// `AGENTS.md` (Cursor).
 pub const RULE_BODY_HOOK_NOTE: &str = r#"## Build Commands (managed by gw — auto-intercepted)
 
 Gradle commands are automatically wrapped with `gw` via the configured PreToolUse hook — no manual action needed.
