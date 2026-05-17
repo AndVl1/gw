@@ -38,7 +38,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_console_plain: bool,
 
-    /// Subcommand or command to run (init, uninstall, doctor, hook, rewrite, gain, or any external command)
+    /// Subcommand or command to run (init, uninstall, upgrade, doctor, hook, rewrite, gain, or any external command)
     #[arg(required = true)]
     pub args: Vec<String>,
 }
@@ -51,6 +51,7 @@ pub enum Dispatch<'a> {
     Rewrite(&'a [String]),
     Gain(&'a [String]),
     Doctor,
+    Upgrade,
     External(&'a [String]),
 }
 
@@ -71,6 +72,13 @@ pub fn dispatch<'a>(args: &'a [String]) -> Result<Dispatch<'a>, String> {
                 Err("gw doctor: takes no arguments".into())
             } else {
                 Ok(Dispatch::Doctor)
+            }
+        }
+        Some("upgrade") => {
+            if args.len() > 1 {
+                Err("gw upgrade: takes no arguments".into())
+            } else {
+                Ok(Dispatch::Upgrade)
             }
         }
         _ => Ok(Dispatch::External(args)),
@@ -212,6 +220,15 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         assert!(dispatch(&s(&["doctor", "--all"])).is_err());
+    }
+
+    #[test]
+    fn upgrade_takes_no_args() {
+        match dispatch(&s(&["upgrade"])).unwrap() {
+            Dispatch::Upgrade => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(dispatch(&s(&["upgrade", "--all"])).is_err());
     }
 
     #[test]

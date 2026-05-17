@@ -152,6 +152,16 @@ Gemini CLI:
 
 Glyphs: `✓` installed, `⚠` legacy command (re-run `gw init --claude-code` to migrate), `✗` file present but no gw hook, `-` no file.
 
+### Upgrade (`gw upgrade`)
+
+Re-applies the install for every (agent, scope) pair that is already wired up, migrating the on-disk layout to the current scheme. Idempotent — if nothing has changed for that target, it's a no-op. Targets that were never installed stay untouched.
+
+```bash
+gw upgrade
+```
+
+Use this after updating `gw` itself to a version that changes integration layout (e.g. the move from a marker block in `CLAUDE.md` to a dedicated `.claude/rules/gw.md` file, or the legacy `gw hook claude` → `gw hook claude-code` command rename). Saves the dance of `gw uninstall --all --local && gw init --all --local` (which would also re-install agents you never wanted in the first place).
+
 ## Usage
 
 Once `gw init` is run, Claude Code's `Bash` tool calls get auto-rewritten when the command contains `gradlew`:

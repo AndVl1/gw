@@ -554,6 +554,58 @@ fn init_claude_code_migrates_legacy_claude_md_block() {
     );
 }
 
+/// `gw upgrade` re-applies install for every already-installed (agent,scope)
+/// pair, migrating to the current scheme. Targets that are not installed
+/// stay untouched.
+#[test]
+fn upgrade_migrates_installed_targets_only() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+
+    // Simulate an older Claude Code install: hook present + legacy marker
+    // block in CLAUDE.md (the pre-rules-dir scheme). Codex NOT installed.
+    let settings = dir.path().join(".claude/settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"gw hook claude-code"}]}]}}"#,
+    )
+    .unwrap();
+    let claude_md = dir.path().join("CLAUDE.md");
+    std::fs::write(
+        &claude_md,
+        "# Project rules\n\n<!-- gw:begin -->\n## old body\n<!-- gw:end -->\n",
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .arg("upgrade")
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw upgrade");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Claude Code (local) was installed → migrated:
+    // - Legacy CLAUDE.md block stripped, user content preserved.
+    let after = std::fs::read_to_string(&claude_md).unwrap();
+    assert!(after.contains("Project rules"));
+    assert!(!after.contains("<!-- gw:begin -->"));
+    // - New rules file in place.
+    assert!(dir.path().join(".claude/rules/gw.md").exists());
+
+    // Codex (local) was NOT installed → AGENTS.md must NOT have appeared.
+    assert!(
+        !dir.path().join("AGENTS.md").exists(),
+        "upgrade must not install agents that were not previously installed"
+    );
+}
+
 /// Local-only agent with --global (default) scope warns and skips.
 #[test]
 fn init_cline_global_warns_and_skips() {
