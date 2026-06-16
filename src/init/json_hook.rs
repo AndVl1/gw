@@ -551,4 +551,216 @@ mod tests {
             InstallOutcome::AlreadyInstalled
         ));
     }
+
+    // ── Hook ordering ────────────────────────────────────────────────────────
+
+    /// When a competing Bash PreToolUse hook (e.g. rtk) already sits at index 0,
+    /// `install_claude` must place gw at index 0 and push the competitor to index 1.
+    #[test]
+    fn claude_insert_with_preexisting_hook_places_gw_at_front() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            install_claude(&path).unwrap(),
+            InstallOutcome::Installed
+        ));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = v["hooks"][CLAUDE_EVENT].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "both hooks present");
+        assert_eq!(
+            arr[0]["hooks"][0]["command"], CLAUDE_HOOK_COMMAND,
+            "gw at index 0"
+        );
+        assert_eq!(
+            arr[1]["hooks"][0]["command"], "rtk hook claude",
+            "competitor at index 1"
+        );
+    }
+
+    /// If gw's hook is already installed but NOT at index 0 (e.g. pushed behind
+    /// a competing hook), running install again must move it to index 0 without
+    /// creating a duplicate entry.
+    #[test]
+    fn claude_install_moves_gw_hook_to_front_without_duplication() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // rtk at [0], gw at [1]
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]},{"matcher":"Bash","hooks":[{"type":"command","command":"gw hook claude-code"}]}]}}"#,
+        )
+        .unwrap();
+        // Status: Installed (gw command is found, just not at front)
+        assert!(matches!(
+            status_claude(&path).unwrap(),
+            AgentStatus::Installed
+        ));
+        // Install moves gw to front
+        assert!(matches!(
+            install_claude(&path).unwrap(),
+            InstallOutcome::Installed
+        ));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = v["hooks"][CLAUDE_EVENT].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "no duplication");
+        assert_eq!(
+            arr[0]["hooks"][0]["command"], CLAUDE_HOOK_COMMAND,
+            "gw at index 0"
+        );
+        assert_eq!(
+            arr[1]["hooks"][0]["command"], "rtk hook claude",
+            "competitor at index 1"
+        );
+    }
+
+    /// Running install on an already-front hook must be a no-op.
+    #[test]
+    fn claude_install_already_at_front_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        install_claude(&path).unwrap();
+        assert!(matches!(
+            install_claude(&path).unwrap(),
+            InstallOutcome::AlreadyInstalled
+        ));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = v["hooks"][CLAUDE_EVENT].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+    }
+
+    // ── Legacy migration ─────────────────────────────────────────────────────
+
+    /// Settings with rtk at [0] and legacy `gw hook claude` at [1]:
+    /// after install, the current command is at [0], rtk remains at [1], and
+    /// the legacy entry is gone.
+    #[test]
+    fn claude_migrates_legacy_with_competing_rtk_hook() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // rtk at [0], legacy gw at [1]
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]},{"matcher":"Bash","hooks":[{"type":"command","command":"gw hook claude"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            status_claude(&path).unwrap(),
+            AgentStatus::InstalledLegacy
+        ));
+        assert!(matches!(
+            install_claude(&path).unwrap(),
+            InstallOutcome::Installed
+        ));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = v["hooks"][CLAUDE_EVENT].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            2,
+            "legacy removed, current added: 2 entries total"
+        );
+        assert_eq!(
+            arr[0]["hooks"][0]["command"], CLAUDE_HOOK_COMMAND,
+            "gw current at index 0"
+        );
+        assert_eq!(
+            arr[1]["hooks"][0]["command"], "rtk hook claude",
+            "rtk at index 1"
+        );
+    }
+
+    // ── Conflict detection ───────────────────────────────────────────────────
+
+    /// `conflicts_claude` returns commands of non-gw Bash hooks when they are present.
+    #[test]
+    fn conflicts_claude_returns_non_gw_hooks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"},{"type":"command","command":"some-other-hook"}]},{"matcher":"Bash","hooks":[{"type":"command","command":"gw hook claude-code"}]}]}}"#,
+        )
+        .unwrap();
+        let conflicts = conflicts_claude(&path).unwrap();
+        assert_eq!(conflicts.len(), 2);
+        assert!(conflicts.contains(&"rtk hook claude".to_string()));
+        assert!(conflicts.contains(&"some-other-hook".to_string()));
+    }
+
+    /// `conflicts_claude` returns an empty list when only gw hooks are present.
+    #[test]
+    fn conflicts_claude_empty_when_only_gw_hooks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"gw hook claude-code"}]}]}}"#,
+        )
+        .unwrap();
+        let conflicts = conflicts_claude(&path).unwrap();
+        assert!(conflicts.is_empty(), "no false positives for gw's own hook");
+    }
+
+    /// `conflicts_claude` also excludes the legacy command from the conflict list —
+    /// legacy gw is still gw's own hook, not a third-party conflict.
+    #[test]
+    fn conflicts_claude_empty_when_only_legacy_gw_hook() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"gw hook claude"}]}]}}"#,
+        )
+        .unwrap();
+        let conflicts = conflicts_claude(&path).unwrap();
+        assert!(
+            conflicts.is_empty(),
+            "legacy gw hook must not be flagged as a conflict"
+        );
+    }
+
+    /// `conflicts_claude` returns empty when the file does not exist.
+    #[test]
+    fn conflicts_claude_empty_when_no_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let conflicts = conflicts_claude(&path).unwrap();
+        assert!(conflicts.is_empty());
+    }
+
+    // ── Uninstall after reorder ──────────────────────────────────────────────
+
+    /// After gw is reordered to index 0, uninstall removes only gw's entry and
+    /// leaves the competitor intact.
+    #[test]
+    fn claude_uninstall_after_reorder_removes_gw_leaves_others() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // rtk at [0], gw at [1]
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]},{"matcher":"Bash","hooks":[{"type":"command","command":"gw hook claude-code"}]}]}}"#,
+        )
+        .unwrap();
+        // Move gw to front
+        install_claude(&path).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"][CLAUDE_EVENT][0]["hooks"][0]["command"], CLAUDE_HOOK_COMMAND,
+            "precondition: gw at front"
+        );
+        // Uninstall must remove only gw
+        assert!(matches!(
+            uninstall_claude(&path).unwrap(),
+            UninstallOutcome::Removed
+        ));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = v["hooks"][CLAUDE_EVENT].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "only rtk should remain");
+        assert_eq!(arr[0]["hooks"][0]["command"], "rtk hook claude");
+    }
 }
