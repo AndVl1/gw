@@ -8,7 +8,7 @@
 use anyhow::Result;
 use std::io::Write;
 
-use crate::init::{self, Agent, AgentStatus, Scope};
+use crate::init::{self, json_hook, Agent, AgentStatus, Scope};
 
 pub fn run() -> Result<i32> {
     let mut out = std::io::stdout().lock();
@@ -48,6 +48,33 @@ fn write_report<W: Write>(out: &mut W) -> Result<i32> {
             out,
             "note: legacy `gw hook claude` command detected. Re-run `gw init --claude-code` to migrate."
         )?;
+    }
+
+    // Warn about non-gw Bash PreToolUse hooks in Claude Code's global settings.
+    // They compete for the same events and may intercept gradle commands before
+    // gw if they appear earlier in the array.
+    if let Some(settings_path) = Agent::ClaudeCode.path(Scope::Global) {
+        let conflicts = json_hook::conflicts_claude(&settings_path)?;
+        if !conflicts.is_empty() {
+            writeln!(out)?;
+            writeln!(
+                out,
+                "warning: other Bash PreToolUse hooks detected in {}:",
+                settings_path.display()
+            )?;
+            for cmd in &conflicts {
+                writeln!(out, "  - {cmd}")?;
+            }
+            writeln!(
+                out,
+                "  These hooks also match 'Bash' and run for every shell command."
+            )?;
+            writeln!(
+                out,
+                "  If gradle interception is unreliable, re-run `gw init --claude-code`"
+            )?;
+            writeln!(out, "  to ensure gw's hook is ordered first.")?;
+        }
     }
 
     Ok(0)
