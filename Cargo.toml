@@ -1,6 +1,6 @@
 [package]
 name = "gw"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 description = "Gradle output filter — strips noise, keeps errors/warnings/status, shows heartbeat"
 license = "MIT"
