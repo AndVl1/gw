@@ -762,6 +762,113 @@ fn injects_console_plain_into_gradle_invocation() {
     );
 }
 
+/// `gw init --claude-code --local` with a pre-existing rtk-like hook in the
+/// local settings must place gw at index 0 and push rtk to index 1.
+#[test]
+fn init_claude_code_with_competing_hook_places_gw_first() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]}]}}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args(["init", "--claude-code", "--local"])
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw init");
+    assert_eq!(out.status.code(), Some(0));
+
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let arr = v["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(arr.len(), 2, "both hooks present");
+    assert_eq!(
+        arr[0]["hooks"][0]["command"], "gw hook claude-code",
+        "gw at index 0"
+    );
+    assert_eq!(
+        arr[1]["hooks"][0]["command"], "rtk hook claude",
+        "competitor at index 1"
+    );
+}
+
+/// `gw upgrade` with a legacy `gw hook claude` local hook must replace the
+/// command with `gw hook claude-code` in place.
+#[test]
+fn upgrade_migrates_legacy_hook_command() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let settings = dir.path().join(".claude/settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"gw hook claude"}]}]}}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .arg("upgrade")
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .output()
+        .expect("spawn gw upgrade");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let arr = v["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0]["hooks"][0]["command"], "gw hook claude-code",
+        "legacy command replaced with current"
+    );
+}
+
+/// `gw doctor` must warn when non-gw Bash PreToolUse hooks are present in the
+/// global Claude Code settings file.
+#[test]
+fn doctor_warns_about_conflicting_hooks() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let settings = dir.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"},{"type":"command","command":"gw hook claude-code"}]}]}}"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = {
+        let out = Command::new(bin())
+            .arg("doctor")
+            .env("HOME", dir.path().to_str().unwrap())
+            .output()
+            .expect("spawn gw doctor");
+        let code = out.status.code().unwrap_or(-1);
+        (
+            code,
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    assert_eq!(code, 0, "doctor exits 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("warning") && stdout.contains("rtk hook claude"),
+        "expected conflict warning mentioning the competing hook, got stdout: {stdout}"
+    );
+}
+
 /// `--no-console-plain` opts out of injection.
 #[cfg(unix)]
 #[test]
