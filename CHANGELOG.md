@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.13](https://github.com/AndVl1/gw/compare/v0.2.12...v0.2.13) - 2026-06-22
+
+### Added
+
+- *(doctor)* warn about conflicting Bash PreToolUse hooks
+
+### Fixed
+
+- *(init)* insert gw hook at index 0 and migrate legacy on install
+
+### Other
+
+- *(init)* add hook ordering and conflict detection tests
+
 ## [0.2.12](https://github.com/AndVl1/gw/compare/v0.2.11...v0.2.12) - 2026-05-17
 
 ### Added
