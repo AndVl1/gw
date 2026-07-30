@@ -20,6 +20,37 @@ fn bare_token(token: &str) -> &str {
     }
 }
 
+/// Drop heredoc bodies from a segment, keeping the command line itself.
+///
+/// Everything a heredoc feeds to a command is data (a python script, a config,
+/// a commit message), so `gradlew` mentioned there must not make the segment
+/// look like a build invocation.
+fn strip_heredoc_bodies(seg: &str) -> String {
+    let mut out = String::new();
+    let mut lines = seg.split('\n');
+    while let Some(line) = lines.next() {
+        out.push_str(line);
+        out.push('\n');
+        // Collect delimiters opened on this line, then skip their bodies.
+        let mut rest = line;
+        let mut delims = Vec::new();
+        while let Some(i) = rest.find("<<") {
+            if let Some(d) = heredoc_delimiter(&rest[i..]) {
+                delims.push(d);
+            }
+            rest = &rest[i + 2..];
+        }
+        for delim in delims {
+            for body in lines.by_ref() {
+                if body.trim() == delim {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// True iff `seg` invokes `gradlew` as a runnable command — either directly
 /// (`./gradlew assemble`) or via a wrapper binary that takes a *path* to
 /// gradlew as its argument (`mainframer ./gradlew test`,
@@ -30,6 +61,7 @@ fn bare_token(token: &str) -> &str {
 /// is data, not an executable. The path requirement (`./`, `/`, `../`
 /// prefix) is what filters those out.
 fn segment_invokes_gradlew(seg: &str) -> bool {
+    let seg = strip_heredoc_bodies(seg);
     let stripped = ENV_PREFIX.replace(seg.trim_start(), "").into_owned();
     let mut tokens = stripped.split_whitespace();
     let Some(first) = tokens.next() else {
@@ -49,16 +81,84 @@ fn segment_invokes_gradlew(seg: &str) -> bool {
     false
 }
 
+/// Parse a heredoc redirection at the start of `rest` (`<<EOF`, `<<-'EOF'`,
+/// `<<< "x"` is *not* a heredoc). Returns the delimiter word if found.
+///
+/// Only the operator and its delimiter are inspected; quoting of the
+/// delimiter (`<<'EOF'`, `<<"EOF"`) does not change where the body ends.
+fn heredoc_delimiter(rest: &str) -> Option<String> {
+    let after_op = rest.strip_prefix("<<")?;
+    // `<<<` is a here-string, not a heredoc: no body to skip.
+    if after_op.starts_with('<') {
+        return None;
+    }
+    let after_dash = after_op.strip_prefix('-').unwrap_or(after_op);
+    let word = after_dash.trim_start();
+    let delim: String = if let Some(q) = word.strip_prefix('\'') {
+        q.chars().take_while(|&c| c != '\'').collect()
+    } else if let Some(q) = word.strip_prefix('"') {
+        q.chars().take_while(|&c| c != '"').collect()
+    } else {
+        word.chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+            .collect()
+    };
+    if delim.is_empty() {
+        None
+    } else {
+        Some(delim)
+    }
+}
+
 /// Split a shell command line into (segment, separator-after) pairs at
-/// top-level `;`, `&&`, `||`, `|`, `&`. Respects single/double quotes and
-/// backslash escapes so separators inside quoted strings are preserved.
+/// top-level `;`, `&&`, `||`, `|`, `&`. Respects single/double quotes,
+/// backslash escapes and heredoc bodies so separators inside them are
+/// preserved.
 fn split_segments(cmd: &str) -> Vec<(String, String)> {
     let mut segs = Vec::new();
     let mut cur = String::new();
     let mut chars = cmd.chars().peekable();
     let mut in_single = false;
     let mut in_double = false;
+    // Delimiters of heredocs opened on the current line, in order.
+    let mut pending_heredocs: Vec<String> = Vec::new();
     while let Some(c) = chars.next() {
+        // A heredoc body starts after the newline that ends the opening line and
+        // runs verbatim until its delimiter — shell separators inside it are
+        // plain text (e.g. a python script containing `;` or `./gradlew`).
+        if c == '\n' && !pending_heredocs.is_empty() && !in_single && !in_double {
+            cur.push(c);
+            let mut trailing_newline = false;
+            for delim in std::mem::take(&mut pending_heredocs) {
+                let mut line = String::new();
+                trailing_newline = false;
+                loop {
+                    match chars.next() {
+                        Some('\n') => {
+                            let done = line.trim() == delim;
+                            cur.push_str(&line);
+                            line.clear();
+                            if done {
+                                trailing_newline = true;
+                                break;
+                            }
+                            cur.push('\n');
+                        }
+                        Some(ch) => line.push(ch),
+                        None => {
+                            cur.push_str(&line);
+                            break;
+                        }
+                    }
+                }
+            }
+            // The command ends with its heredoc: close the segment so whatever
+            // follows on the next line is analysed on its own.
+            if trailing_newline {
+                segs.push((std::mem::take(&mut cur), "\n".to_string()));
+            }
+            continue;
+        }
         if in_single {
             cur.push(c);
             if c == '\'' {
@@ -79,6 +179,14 @@ fn split_segments(cmd: &str) -> Vec<(String, String)> {
             continue;
         }
         match c {
+            '<' if chars.peek() == Some(&'<') => {
+                // Remember the delimiter; the body is consumed at the newline.
+                let rest: String = std::iter::once('<').chain(chars.clone()).collect();
+                if let Some(delim) = heredoc_delimiter(&rest) {
+                    pending_heredocs.push(delim);
+                }
+                cur.push(c);
+            }
             '\'' => {
                 in_single = true;
                 cur.push(c);
@@ -96,6 +204,12 @@ fn split_segments(cmd: &str) -> Vec<(String, String)> {
             }
             ';' => {
                 segs.push((std::mem::take(&mut cur), ";".to_string()));
+            }
+            // Newline separates commands just like `;` — without this a
+            // multi-line script would be treated as one segment and `gw` would
+            // land on its first line instead of the gradlew invocation.
+            '\n' => {
+                segs.push((std::mem::take(&mut cur), "\n".to_string()));
             }
             '&' => {
                 if chars.peek() == Some(&'&') {
@@ -204,6 +318,56 @@ mod tests {
             detect_rewrite("./gradlew assemble").as_deref(),
             Some("gw ./gradlew assemble")
         );
+    }
+
+    #[test]
+    fn leaves_heredoc_body_alone() {
+        // Script text inside a heredoc is data: mentioning gradlew there must
+        // not inject `gw` into the middle of the script.
+        let cmd = "cat > run.sh << 'EOF'\n./gradlew assemble\nEOF";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    #[test]
+    fn leaves_heredoc_with_separators_alone() {
+        // Separators inside the body must not split segments either — this used
+        // to corrupt python/shell scripts passed via heredoc.
+        let cmd = "python3 - << 'PY'\ns = open(p).read()\nprint('a && b | c; d')\nPY";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    #[test]
+    fn rewrites_command_after_heredoc_body() {
+        let cmd = "cat << 'EOF'\ntext\nEOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat << 'EOF'\ntext\nEOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn rewrites_gradlew_before_heredoc() {
+        let cmd = "./gradlew test << 'EOF'\ninput\nEOF";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("gw ./gradlew test << 'EOF'\ninput\nEOF")
+        );
+    }
+
+    #[test]
+    fn here_string_is_not_heredoc() {
+        // `<<<` is a here-string: no body follows, so the next segment is code.
+        let cmd = "grep x <<< \"data\" && ./gradlew build";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("grep x <<< \"data\" && gw ./gradlew build")
+        );
+    }
+
+    #[test]
+    fn tab_indented_heredoc_delimiter() {
+        let cmd = "cat <<-EOF\n./gradlew assemble\n\tEOF";
+        assert_eq!(detect_rewrite(cmd), None);
     }
 
     #[test]
