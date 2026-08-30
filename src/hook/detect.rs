@@ -20,6 +20,27 @@ fn bare_token(token: &str) -> &str {
     }
 }
 
+/// One top-level shell command plus its trailing syntax.
+///
+/// Reconstruction invariant: concatenating `text + sep + tail` over all
+/// segments reproduces the original command byte-for-byte.
+struct Segment {
+    /// The command line itself — never contains heredoc bodies.
+    text: String,
+    /// Separator that ended the segment (`;`, `&&`, `|`, `\n`, ... or empty).
+    sep: String,
+    /// Heredoc bodies physically following this segment's line, verbatim
+    /// (body lines and delimiter lines, newlines included). Data, not code.
+    tail: String,
+}
+
+/// A heredoc opened on the current line, awaiting its body.
+struct Heredoc {
+    delim: String,
+    /// `<<-` form: leading tabs are stripped before delimiter comparison.
+    strip_tabs: bool,
+}
+
 /// True iff `seg` invokes `gradlew` as a runnable command — either directly
 /// (`./gradlew assemble`) or via a wrapper binary that takes a *path* to
 /// gradlew as its argument (`mainframer ./gradlew test`,
@@ -49,15 +70,337 @@ fn segment_invokes_gradlew(seg: &str) -> bool {
     false
 }
 
-/// Split a shell command line into (segment, separator-after) pairs at
-/// top-level `;`, `&&`, `||`, `|`, `&`. Respects single/double quotes and
-/// backslash escapes so separators inside quoted strings are preserved.
-fn split_segments(cmd: &str) -> Vec<(String, String)> {
-    let mut segs = Vec::new();
+/// Lex a heredoc delimiter word from the main char stream, right after the
+/// `<<` operator was consumed. Every consumed char is also pushed to `cur`
+/// verbatim so the segment text stays byte-identical to the input.
+///
+/// The word follows Bash quote removal: adjacent parts concatenate
+/// (`<<'E''OF'` → `EOF`, `<<\EOF` → `EOF`, `<<'END'foo` → `ENDfoo`),
+/// backslash-newline is a line continuation (`<<EO\␤F` → `EOF`), `$'...'`
+/// (ANSI-C) and `$"..."` (locale) quotes are recognized, an empty quoted
+/// word (`<<''`) is a valid delimiter (body ends at the first empty line),
+/// and any character except an unquoted shell metacharacter may appear
+/// (`END-OF-DATA` is one word). Quoting changes body expansion, not where
+/// the body ends, so only the resulting text matters here.
+fn lex_heredoc_word(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    cur: &mut String,
+) -> Option<Heredoc> {
+    let strip_tabs = if chars.peek() == Some(&'-') {
+        cur.push(chars.next().expect("peeked"));
+        true
+    } else {
+        false
+    };
+    // Whitespace (and line continuations) may separate operator and word.
+    loop {
+        match chars.peek() {
+            Some(' ' | '\t') => cur.push(chars.next().expect("peeked")),
+            Some('\\') => {
+                let mut ahead = chars.clone();
+                ahead.next();
+                if ahead.peek() == Some(&'\n') {
+                    cur.push(chars.next().expect("peeked"));
+                    cur.push(chars.next().expect("peeked"));
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let mut delim = String::new();
+    // An empty `delim` alone can't tell `<<` with no word (syntax error,
+    // ignore) from `<<''` (valid: body ends at the first empty line).
+    let mut has_word = false;
+    loop {
+        match chars.peek() {
+            Some('\'') => {
+                has_word = true;
+                cur.push(chars.next().expect("peeked"));
+                lex_single_quoted(chars, cur, &mut delim);
+            }
+            Some('"') => {
+                has_word = true;
+                cur.push(chars.next().expect("peeked"));
+                lex_double_quoted(chars, cur, &mut delim);
+            }
+            Some('$') => {
+                // `$'...'` (ANSI-C) and `$"..."` (locale) are quote forms:
+                // the `$` is not part of the word. `$(...)` (and `$((...))`)
+                // stays in the word literally — heredoc delimiters undergo
+                // no expansion, so bash closes the body at the literal
+                // `$(...)` line. A plain `$` is a literal word char.
+                let mut ahead = chars.clone();
+                ahead.next();
+                match ahead.peek() {
+                    Some('\'') => {
+                        has_word = true;
+                        cur.push(chars.next().expect("peeked"));
+                        cur.push(chars.next().expect("peeked"));
+                        lex_ansi_c_quoted(chars, cur, &mut delim);
+                    }
+                    Some('"') => {
+                        has_word = true;
+                        cur.push(chars.next().expect("peeked"));
+                        cur.push(chars.next().expect("peeked"));
+                        lex_double_quoted(chars, cur, &mut delim);
+                    }
+                    Some('(') => {
+                        has_word = true;
+                        let d = chars.next().expect("peeked");
+                        cur.push(d);
+                        delim.push(d);
+                        lex_balanced_parens(chars, cur, &mut delim);
+                    }
+                    _ => {
+                        has_word = true;
+                        cur.push(chars.next().expect("peeked"));
+                        delim.push('$');
+                    }
+                }
+            }
+            Some('`') => {
+                // Backtick substitution is likewise literal in the word:
+                // `` <<`echo EOF` `` closes at the literal backtick line.
+                // `\` escapes the next char, so `` \` `` doesn't close.
+                has_word = true;
+                let b = chars.next().expect("peeked");
+                cur.push(b);
+                delim.push(b);
+                while let Some(c) = chars.next() {
+                    cur.push(c);
+                    delim.push(c);
+                    if c == '\\' {
+                        if let Some(&n) = chars.peek() {
+                            chars.next();
+                            cur.push(n);
+                            delim.push(n);
+                        }
+                    } else if c == '`' {
+                        break;
+                    }
+                }
+            }
+            Some('\\') => {
+                cur.push(chars.next().expect("peeked"));
+                match chars.peek() {
+                    // Backslash-newline is a line continuation: both chars
+                    // vanish and the word continues (`<<EO\␤F` → `EOF`).
+                    Some('\n') => {
+                        cur.push(chars.next().expect("peeked"));
+                    }
+                    None => break,
+                    Some(&n) => {
+                        has_word = true;
+                        chars.next();
+                        cur.push(n);
+                        delim.push(n);
+                    }
+                }
+            }
+            // Unquoted metacharacter ends the word.
+            Some(' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')') | None => break,
+            Some(&c) => {
+                has_word = true;
+                chars.next();
+                cur.push(c);
+                delim.push(c);
+            }
+        }
+    }
+    if has_word {
+        Some(Heredoc { delim, strip_tabs })
+    } else {
+        None
+    }
+}
+
+/// Consume a `(...)` group verbatim (the `$` already consumed, `(` about to
+/// follow): everything up to the matching `)` goes into both `cur` and
+/// `delim` literally. Nesting is respected, and parens inside `'...'`,
+/// `"..."` or after `\` don't count — `$(echo ")")` is one group.
+fn lex_balanced_parens(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    cur: &mut String,
+    delim: &mut String,
+) {
+    let mut depth = 0u32;
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        delim.push(c);
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        match c {
+            '\\' => {
+                if let Some(&n) = chars.peek() {
+                    chars.next();
+                    cur.push(n);
+                    delim.push(n);
+                }
+            }
+            '"' => in_double = !in_double,
+            '\'' if !in_double => in_single = true,
+            '(' if !in_double => depth += 1,
+            ')' if !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Consume a `'...'` part (opening quote already consumed): contents are
+/// literal, only `'` closes.
+fn lex_single_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    cur: &mut String,
+    delim: &mut String,
+) {
+    for c in chars.by_ref() {
+        cur.push(c);
+        if c == '\'' {
+            break;
+        }
+        delim.push(c);
+    }
+}
+
+/// Consume a `"..."` part (opening quote already consumed). Inside double
+/// quotes `\` escapes only `"`, `\`, `$` and backtick; a backslash-newline
+/// is a line continuation and both chars vanish.
+fn lex_double_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    cur: &mut String,
+    delim: &mut String,
+) {
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        if c == '"' {
+            break;
+        }
+        if c == '\\' {
+            match chars.peek() {
+                Some('\n') => {
+                    cur.push(chars.next().expect("peeked"));
+                }
+                Some(&n) => {
+                    chars.next();
+                    cur.push(n);
+                    if !matches!(n, '"' | '\\' | '$' | '`') {
+                        delim.push('\\');
+                    }
+                    delim.push(n);
+                }
+                None => {}
+            }
+        } else {
+            delim.push(c);
+        }
+    }
+}
+
+/// Consume a `$'...'` ANSI-C part (opening `$'` already consumed): `\`
+/// escape sequences expand per Bash; an unknown escape keeps the backslash.
+/// Numeric escapes (`\xHH`, `\nnn`, `\uHHHH`) are kept literally — they
+/// virtually never appear in heredoc delimiters and degrading to a
+/// non-matching delimiter is safer than mis-decoding one.
+fn lex_ansi_c_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    cur: &mut String,
+    delim: &mut String,
+) {
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        if c == '\'' {
+            break;
+        }
+        if c == '\\' {
+            if let Some(&n) = chars.peek() {
+                chars.next();
+                cur.push(n);
+                match n {
+                    'n' => delim.push('\n'),
+                    't' => delim.push('\t'),
+                    'r' => delim.push('\r'),
+                    'a' => delim.push('\x07'),
+                    'b' => delim.push('\x08'),
+                    'e' | 'E' => delim.push('\x1b'),
+                    'f' => delim.push('\x0c'),
+                    'v' => delim.push('\x0b'),
+                    '\\' | '\'' | '"' | '?' => delim.push(n),
+                    _ => {
+                        delim.push('\\');
+                        delim.push(n);
+                    }
+                }
+            }
+        } else {
+            delim.push(c);
+        }
+    }
+}
+
+/// Disambiguate `((` at command position: arithmetic command vs nested
+/// subshells. Bash re-parses `((...)` as subshells unless the paren that
+/// matches the inner `(` is immediately followed by the outer closing `)`
+/// (`((1+2))` → arith; `((cmd) && (cmd))` → subshells). `chars` points at
+/// the second `(`. Unterminated input (no matching paren) is already a
+/// syntax error; prefer arith so a `<<` inside can't open a phantom heredoc.
+///
+/// The scan is capped: without a bound, pathological runs of `(` make the
+/// repeated lookaheads O(n²) over the whole command. No real arithmetic
+/// command is hundreds of chars long, so past the cap treat it as
+/// subshells — the plain-char path, same as before the arm existed.
+fn arith_command_ahead(chars: &std::iter::Peekable<std::str::Chars>) -> bool {
+    const LOOKAHEAD_CAP: usize = 512;
+    let mut ahead = chars.clone();
+    ahead.next(); // the second `(`
+    let mut depth = 1u32;
+    for c in ahead.by_ref().take(LOOKAHEAD_CAP) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return ahead.next() == Some(')');
+                }
+            }
+            _ => {}
+        }
+    }
+    // Cap hit (more input left): not arithmetic. EOF within the cap:
+    // unterminated, prefer arith.
+    ahead.next().is_none()
+}
+
+/// Split a shell command line into [`Segment`]s at top-level `;`, `&&`,
+/// `||`, `|`, `&`, `\n`. Single-pass lexer tracking quotes, backslash
+/// escapes, comments, `$(( ))` arithmetic and heredocs, so separators (and
+/// `gradlew` mentions) inside any of those are treated as data.
+fn split_segments(cmd: &str) -> Vec<Segment> {
+    let mut segs: Vec<Segment> = Vec::new();
     let mut cur = String::new();
     let mut chars = cmd.chars().peekable();
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_comment = false;
+    // Unclosed parens of a `$(( ... ))` arithmetic expansion; 0 = not in one.
+    let mut arith_depth: u32 = 0;
+    // True when the next char starts a shell word — the only position where
+    // `#` opens a comment.
+    let mut at_word_start = true;
+    // Heredocs opened on the current line, in order; bodies follow the newline.
+    let mut pending_heredocs: Vec<Heredoc> = Vec::new();
     while let Some(c) = chars.next() {
         if in_single {
             cur.push(c);
@@ -78,48 +421,187 @@ fn split_segments(cmd: &str) -> Vec<(String, String)> {
             }
             continue;
         }
+        if arith_depth > 0 {
+            // Verbatim: `<<` here is a bit shift, separators don't split.
+            cur.push(c);
+            match c {
+                '(' => arith_depth += 1,
+                ')' => arith_depth -= 1,
+                _ => {}
+            }
+            // `)` is a metacharacter: right after the closing `))` bash
+            // grants comment position (`((x=1))# note` is a comment).
+            at_word_start = arith_depth == 0;
+            continue;
+        }
+        if in_comment && c != '\n' {
+            cur.push(c);
+            continue;
+        }
+        // A heredoc body starts after the newline that ends the opening line
+        // and runs verbatim until its delimiter — everything in it is data
+        // (a python script, a config), never commands to analyse.
+        if c == '\n' {
+            in_comment = false;
+            let mut tail = String::new();
+            for h in std::mem::take(&mut pending_heredocs) {
+                let mut line = String::new();
+                loop {
+                    match chars.next() {
+                        Some('\n') => {
+                            let done = if h.strip_tabs {
+                                // `<<-`: the closing line may keep or drop
+                                // leading tabs — bash accepts both, even for
+                                // a delimiter that itself starts with a tab.
+                                line == h.delim || line.trim_start_matches('\t') == h.delim
+                            } else {
+                                line == h.delim
+                            };
+                            tail.push_str(&line);
+                            tail.push('\n');
+                            line.clear();
+                            if done {
+                                break;
+                            }
+                        }
+                        Some(ch) => line.push(ch),
+                        None => {
+                            tail.push_str(&line);
+                            break;
+                        }
+                    }
+                }
+            }
+            segs.push(Segment {
+                text: std::mem::take(&mut cur),
+                sep: "\n".to_string(),
+                tail,
+            });
+            at_word_start = true;
+            continue;
+        }
         match c {
+            '#' if at_word_start => {
+                in_comment = true;
+                cur.push(c);
+            }
+            '(' if at_word_start && chars.peek() == Some(&'(') && arith_command_ahead(&chars) => {
+                // `(( ... ))` at command position is an arithmetic command:
+                // `<<` inside is a shift, same as in `$(( ))`. Guarded by a
+                // lookahead because `((cmd) && (cmd))` is nested subshells.
+                cur.push(c);
+                cur.push(chars.next().expect("peeked"));
+                arith_depth = 2;
+                at_word_start = false;
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                cur.push(c);
+                cur.push(chars.next().expect("peeked"));
+                if chars.peek() == Some(&'(') {
+                    cur.push(chars.next().expect("peeked"));
+                    arith_depth = 2;
+                }
+                at_word_start = false;
+            }
+            '<' if chars.peek() == Some(&'<') => {
+                cur.push(c);
+                cur.push(chars.next().expect("peeked"));
+                if chars.peek() == Some(&'<') {
+                    // `<<<` is a here-string: no body to skip.
+                    cur.push(chars.next().expect("peeked"));
+                } else if let Some(h) = lex_heredoc_word(&mut chars, &mut cur) {
+                    pending_heredocs.push(h);
+                }
+                at_word_start = false;
+            }
             '\'' => {
                 in_single = true;
                 cur.push(c);
+                at_word_start = false;
             }
             '"' => {
                 in_double = true;
                 cur.push(c);
+                at_word_start = false;
             }
             '\\' => {
                 cur.push(c);
-                if let Some(&n) = chars.peek() {
-                    cur.push(n);
-                    chars.next();
+                match chars.peek() {
+                    // Backslash-newline is a line continuation: the logical
+                    // line goes on, so no segment split, no heredoc body
+                    // start, and — since both chars vanish in shell — the
+                    // word-boundary state is whatever it was before the
+                    // backslash (`echo foo \␤# c` — the `#` opens a comment).
+                    Some('\n') => {
+                        cur.push(chars.next().expect("peeked"));
+                    }
+                    Some(&n) => {
+                        cur.push(n);
+                        chars.next();
+                        at_word_start = false;
+                    }
+                    None => {
+                        at_word_start = false;
+                    }
                 }
             }
             ';' => {
-                segs.push((std::mem::take(&mut cur), ";".to_string()));
+                segs.push(Segment {
+                    text: std::mem::take(&mut cur),
+                    sep: ";".to_string(),
+                    tail: String::new(),
+                });
+                at_word_start = true;
             }
             '&' => {
                 if chars.peek() == Some(&'&') {
                     chars.next();
-                    segs.push((std::mem::take(&mut cur), "&&".to_string()));
+                    segs.push(Segment {
+                        text: std::mem::take(&mut cur),
+                        sep: "&&".to_string(),
+                        tail: String::new(),
+                    });
+                    at_word_start = true;
                 } else if cur.ends_with('>') || chars.peek() == Some(&'>') {
                     // Redirect form: `2>&1`, `>&2`, `&>file`. Keep `&` literal.
                     cur.push(c);
+                    at_word_start = false;
                 } else {
-                    segs.push((std::mem::take(&mut cur), "&".to_string()));
+                    segs.push(Segment {
+                        text: std::mem::take(&mut cur),
+                        sep: "&".to_string(),
+                        tail: String::new(),
+                    });
+                    at_word_start = true;
                 }
             }
             '|' => {
-                if chars.peek() == Some(&'|') {
+                let sep = if chars.peek() == Some(&'|') {
                     chars.next();
-                    segs.push((std::mem::take(&mut cur), "||".to_string()));
+                    "||"
                 } else {
-                    segs.push((std::mem::take(&mut cur), "|".to_string()));
-                }
+                    "|"
+                };
+                segs.push(Segment {
+                    text: std::mem::take(&mut cur),
+                    sep: sep.to_string(),
+                    tail: String::new(),
+                });
+                at_word_start = true;
             }
-            _ => cur.push(c),
+            _ => {
+                cur.push(c);
+                // `)` too: `(echo ok)# c` — Bash starts a comment right
+                // after the closing paren.
+                at_word_start = matches!(c, ' ' | '\t' | '(' | ')');
+            }
         }
     }
-    segs.push((cur, String::new()));
+    segs.push(Segment {
+        text: cur,
+        sep: String::new(),
+        tail: String::new(),
+    });
     segs
 }
 
@@ -151,14 +633,14 @@ fn rewrite_segment(seg: &str) -> Option<String> {
 pub fn detect_truncation(command: &str) -> Option<&'static str> {
     let segments = split_segments(command);
     for i in 0..segments.len().saturating_sub(1) {
-        let (seg, sep) = &segments[i];
-        if sep != "|" {
+        let seg = &segments[i];
+        if seg.sep != "|" {
             continue;
         }
-        if !segment_invokes_gradlew(seg.trim_start()) {
+        if !segment_invokes_gradlew(seg.text.trim_start()) {
             continue;
         }
-        let next = segments[i + 1].0.trim_start();
+        let next = segments[i + 1].text.trim_start();
         let first = next.split_whitespace().next().unwrap_or("");
         let bare = bare_token(first);
         if bare == "tail" || bare == "head" {
@@ -177,15 +659,16 @@ pub fn detect_rewrite(command: &str) -> Option<String> {
     let segments = split_segments(command);
     let mut any = false;
     let mut out = String::new();
-    for (seg, sep) in &segments {
-        match rewrite_segment(seg) {
+    for seg in &segments {
+        match rewrite_segment(&seg.text) {
             Some(new) => {
                 out.push_str(&new);
                 any = true;
             }
-            None => out.push_str(seg),
+            None => out.push_str(&seg.text),
         }
-        out.push_str(sep);
+        out.push_str(&seg.sep);
+        out.push_str(&seg.tail);
     }
     if any {
         Some(out)
@@ -204,6 +687,56 @@ mod tests {
             detect_rewrite("./gradlew assemble").as_deref(),
             Some("gw ./gradlew assemble")
         );
+    }
+
+    #[test]
+    fn leaves_heredoc_body_alone() {
+        // Script text inside a heredoc is data: mentioning gradlew there must
+        // not inject `gw` into the middle of the script.
+        let cmd = "cat > run.sh << 'EOF'\n./gradlew assemble\nEOF";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    #[test]
+    fn leaves_heredoc_with_separators_alone() {
+        // Separators inside the body must not split segments either — this used
+        // to corrupt python/shell scripts passed via heredoc.
+        let cmd = "python3 - << 'PY'\ns = open(p).read()\nprint('a && b | c; d')\nPY";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    #[test]
+    fn rewrites_command_after_heredoc_body() {
+        let cmd = "cat << 'EOF'\ntext\nEOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat << 'EOF'\ntext\nEOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn rewrites_gradlew_before_heredoc() {
+        let cmd = "./gradlew test << 'EOF'\ninput\nEOF";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("gw ./gradlew test << 'EOF'\ninput\nEOF")
+        );
+    }
+
+    #[test]
+    fn here_string_is_not_heredoc() {
+        // `<<<` is a here-string: no body follows, so the next segment is code.
+        let cmd = "grep x <<< \"data\" && ./gradlew build";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("grep x <<< \"data\" && gw ./gradlew build")
+        );
+    }
+
+    #[test]
+    fn tab_indented_heredoc_delimiter() {
+        let cmd = "cat <<-EOF\n./gradlew assemble\n\tEOF";
+        assert_eq!(detect_rewrite(cmd), None);
     }
 
     #[test]
@@ -466,5 +999,359 @@ mod tests {
         // The `| tail` is inside the SSH-quoted arg — locally it's a single
         // segment whose command is `ssh`, not gradlew.
         assert!(detect_truncation(r#"ssh host "./gradlew test | tail -n 20""#).is_none());
+    }
+
+    // Heredoc lexer regressions (PR #29 review) ───────────────────────────────
+
+    /// `text + sep + tail` over all segments must reproduce the input.
+    fn reconstruct(cmd: &str) -> String {
+        split_segments(cmd)
+            .iter()
+            .map(|s| format!("{}{}{}", s.text, s.sep, s.tail))
+            .collect()
+    }
+
+    #[test]
+    fn heredoc_body_not_attached_to_piped_command() {
+        // Body follows the whole pipeline; it must not make the `tee`
+        // segment look like a gradle invocation.
+        let cmd = "cat <<EOF | tee /tmp/run.sh\n./gradlew assemble\nEOF";
+        assert_eq!(detect_rewrite(cmd), None);
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn rewrites_gradlew_piped_with_heredoc() {
+        let cmd = "./gradlew run <<EOF | tee log\ndata\nEOF";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("gw ./gradlew run <<EOF | tee log\ndata\nEOF")
+        );
+    }
+
+    #[test]
+    fn multiple_heredocs_preserve_newlines() {
+        // The newline after an intermediate delimiter must survive: `x\nA\ny\nB`.
+        let cmd = "./gradlew task <<A <<B\nx\nA\ny\nB";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("gw ./gradlew task <<A <<B\nx\nA\ny\nB")
+        );
+    }
+
+    #[test]
+    fn backslash_escaped_delimiter() {
+        // `<<\EOF` quotes the delimiter; the body still ends at `EOF`.
+        let cmd = "cat <<\\EOF\n./gradlew x\nEOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<\\EOF\n./gradlew x\nEOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn concatenated_quoted_delimiter_parts() {
+        // `<<'END'foo` → delimiter `ENDfoo`; a bare `END` line is body data.
+        let cmd = "cat <<'END'foo\nEND\nENDfoo\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<'END'foo\nEND\nENDfoo\ngw ./gradlew test")
+        );
+        // `<<'E''OF'` → delimiter `EOF`.
+        let cmd = "cat <<'E''OF'\n./gradlew x\nEOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<'E''OF'\n./gradlew x\nEOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn hyphenated_delimiter() {
+        let cmd = "cat <<END-OF-DATA\ndata\nEND-OF-DATA\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<END-OF-DATA\ndata\nEND-OF-DATA\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn trailing_space_does_not_close_heredoc() {
+        // `EOF ` (trailing space) is still body data in shell; only the exact
+        // `EOF` line closes the heredoc, so the gradlew line is data too.
+        let cmd = "cat <<EOF\n./gradlew test\nEOF \nEOF";
+        assert_eq!(detect_rewrite(cmd), None);
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn arithmetic_shift_is_not_heredoc() {
+        let cmd = "echo $((1 << 4))\n./gradlew build";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $((1 << 4))\ngw ./gradlew build")
+        );
+    }
+
+    #[test]
+    fn heredoc_operator_in_comment_ignored() {
+        let cmd = "echo start\n# docs mention <<EOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo start\n# docs mention <<EOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn hash_inside_word_is_not_comment() {
+        // `#` not at word start does not open a comment — the heredoc after
+        // it is real and its body must be skipped.
+        let cmd = "echo a#b <<EOF\n./gradlew x\nEOF";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    // Second review round (PR #29): Bash quote removal + comment boundaries ───
+
+    #[test]
+    fn line_continuation_in_delimiter_word() {
+        // `<<EO\␤F` — backslash-newline vanishes, delimiter is `EOF`.
+        let cmd = "cat <<EO\\\nF\n./gradlew body\nEOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<EO\\\nF\n./gradlew body\nEOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn empty_single_quoted_delimiter() {
+        // `<<''` is valid: the body ends at the first empty line. The body
+        // must stay byte-identical; only the command after it is rewritten.
+        let cmd = "cat <<''\n./gradlew body\n\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<''\n./gradlew body\n\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn empty_double_quoted_delimiter() {
+        let cmd = "cat <<\"\"\n./gradlew body\n\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<\"\"\n./gradlew body\n\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn ansi_c_quoted_delimiter() {
+        // `$'EOF'` — the `$` is part of the quoting, not the word.
+        let cmd = "cat <<$'EOF'\n./gradlew body\nEOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<$'EOF'\n./gradlew body\nEOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn ansi_c_quoted_delimiter_with_escape() {
+        // `$'A\tB'` expands to `A<TAB>B`; only that exact line closes the body.
+        let cmd = "cat <<$'A\\tB'\nAtB\nA\tB\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<$'A\\tB'\nAtB\nA\tB\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn locale_quoted_delimiter() {
+        // `$"EOF"` — locale quoting, delimiter `EOF`.
+        let cmd = "cat <<$\"EOF\"\n./gradlew body\nEOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<$\"EOF\"\n./gradlew body\nEOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn plain_dollar_stays_in_delimiter() {
+        // Heredoc words undergo no expansion: `<<$EOF` means delimiter `$EOF`.
+        let cmd = "cat <<$EOF\n./gradlew body\n$EOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<$EOF\n./gradlew body\n$EOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn comment_after_line_continuation() {
+        // `echo foo \␤# ...` — the continuation joins the lines, leaving
+        // `#` at a word start: it's a comment, not a heredoc opener.
+        let cmd = "echo foo \\\n# docs mention <<EOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo foo \\\n# docs mention <<EOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn comment_after_subshell_close() {
+        // Bash starts a comment right after `)`.
+        let cmd = "(echo ok)# docs mention <<EOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("(echo ok)# docs mention <<EOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn escaped_char_before_hash_is_not_comment() {
+        // `\x#` — the escaped char is a word char, so `#` continues the word
+        // and the heredoc after it is real.
+        let cmd = "echo \\a# <<EOF\n./gradlew x\nEOF";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    // Critic-agent findings (pre-commit adversarial review) ──────────────────
+
+    #[test]
+    fn standalone_arithmetic_command_is_not_heredoc() {
+        // `(( ... ))` at command position: `<<` is a shift.
+        let cmd = "((size = 1 << 20))\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("((size = 1 << 20))\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn command_substitution_delimiter_is_literal() {
+        // Heredoc words are not expanded: `<<$(echo EOF)` closes only at the
+        // literal `$(echo EOF)` line.
+        let cmd = "cat <<$(echo EOF)\nbody\n$(echo EOF)\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<$(echo EOF)\nbody\n$(echo EOF)\ngw ./gradlew test")
+        );
+        // A bare `$` line is body data, not the delimiter — nothing inside
+        // the body may be rewritten.
+        let cmd = "cat <<$(echo EOF)\n$\n./gradlew x\n$(echo EOF)\necho done";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    #[test]
+    fn backtick_delimiter_is_literal() {
+        let cmd = "cat <<`echo EOF`\nbody\n`echo EOF`\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<`echo EOF`\nbody\n`echo EOF`\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn dash_heredoc_with_tab_leading_delimiter() {
+        // `<<-` closing line may keep its tabs even when the delimiter
+        // itself begins with one.
+        let cmd = "cat <<-$'\\tX'\nbody\n\tX\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<-$'\\tX'\nbody\n\tX\ngw ./gradlew test")
+        );
+    }
+
+    // Critic round 2 findings ─────────────────────────────────────────────────
+
+    #[test]
+    fn double_paren_subshells_are_not_arithmetic() {
+        // `((cmd) && cmd)` — bash re-parses as nested subshells; the inner
+        // gradlew is a real invocation and separators must still split.
+        assert_eq!(
+            detect_rewrite("((cd app) && ./gradlew test)").as_deref(),
+            Some("((cd app) && gw ./gradlew test)")
+        );
+    }
+
+    #[test]
+    fn arithmetic_with_nested_parens_stays_arithmetic() {
+        let cmd = "((x = (1 << 2) + 3))\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("((x = (1 << 2) + 3))\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn comment_directly_after_arith_close() {
+        // `))# note` — bash grants comment position right after `))`.
+        let cmd = "((x=1))# note <<EOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("((x=1))# note <<EOF\ngw ./gradlew test")
+        );
+        let cmd = "echo $((1+1))# note <<EOF\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $((1+1))# note <<EOF\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn quoted_paren_inside_substitution_delimiter() {
+        // `$(echo ")")` — the quoted `)` doesn't end the group; the literal
+        // `$(echo ")")` line closes the body.
+        let cmd = "cat <<$(echo \")\")\nbody\n$(echo \")\")\n./gradlew test";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <<$(echo \")\")\nbody\n$(echo \")\")\ngw ./gradlew test")
+        );
+    }
+
+    #[test]
+    fn escaped_backtick_inside_backtick_delimiter() {
+        // `` `a\`b` `` — the escaped backtick doesn't close the substitution;
+        // the heredoc body never terminates, so nothing is rewritten.
+        let cmd = "cat <<`a\\`b`\nbody\n./gradlew test";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    #[test]
+    fn segments_reconstruct_review_round_two_cases() {
+        for cmd in [
+            "cat <<EO\\\nF\n./gradlew body\nEOF\n./gradlew test",
+            "cat <<''\n./gradlew body\n\n./gradlew test",
+            "cat <<\"\"\n./gradlew body\n\n./gradlew test",
+            "cat <<$'EOF'\nbody\nEOF\n./gradlew test",
+            "cat <<$\"EOF\"\nbody\nEOF\n./gradlew test",
+            "cat <<$'A\\tB'\nAtB\nA\tB\n./gradlew test",
+            "cat <<$EOF\nbody\n$EOF\n./gradlew test",
+            "echo foo \\\n# docs mention <<EOF\n./gradlew test",
+            "(echo ok)# docs mention <<EOF\n./gradlew test",
+            "cat << \\\nEOF\nbody\nEOF\necho done",
+            "((size = 1 << 20))\n./gradlew test",
+            "cat <<$(echo EOF)\nbody\n$(echo EOF)\n./gradlew test",
+            "cat <<`echo EOF`\nbody\n`echo EOF`\n./gradlew test",
+            "cat <<-$'\\tX'\nbody\n\tX\n./gradlew test",
+            "((cd app) && ./gradlew test)",
+            "((x=1))# note <<EOF\n./gradlew test",
+            "cat <<$(echo \")\")\nbody\n$(echo \")\")\n./gradlew test",
+            "cat <<`a\\`b`\nbody\n./gradlew test",
+        ] {
+            assert_eq!(reconstruct(cmd), cmd, "reconstruction differs for {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn segments_reconstruct_input_verbatim() {
+        for cmd in [
+            "cat <<EOF | tee /tmp/run.sh\n./gradlew assemble\nEOF",
+            "./gradlew task <<A <<B\nx\nA\ny\nB",
+            "cat <<\\EOF\nbody\nEOF\necho done",
+            "cat <<END-OF-DATA\ndata\nEND-OF-DATA\n./gradlew test",
+            "echo $((1 << 4))\n./gradlew build",
+            "echo start\n# docs mention <<EOF\n./gradlew test",
+            "cat <<-EOF\n\tindented\n\tEOF",
+            "grep x <<< \"data\" && ./gradlew build",
+            "a; b && c || d | e & f\ng",
+        ] {
+            assert_eq!(reconstruct(cmd), cmd, "reconstruction differs for {cmd:?}");
+        }
     }
 }
