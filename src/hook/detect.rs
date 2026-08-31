@@ -383,6 +383,18 @@ fn arith_command_ahead(chars: &std::iter::Peekable<std::str::Chars>) -> bool {
     ahead.next().is_none()
 }
 
+/// What kind of construct an unmatched `(` opened — decides whether `#`
+/// right after the matching `)` starts a comment (grouping subshell) or
+/// continues the current word (command substitution).
+enum ParenKind {
+    /// `(cmd)`: `)` is a metacharacter, so `#` right after it is granted
+    /// comment position (`(echo ok)# comment`).
+    Subshell,
+    /// `$(cmd)`: the substitution is part of the surrounding word, so `#`
+    /// right after `)` continues that word (`$(cmd)#suffix`).
+    CmdSubst,
+}
+
 /// Split a shell command line into [`Segment`]s at top-level `;`, `&&`,
 /// `||`, `|`, `&`, `\n`. Single-pass lexer tracking quotes, backslash
 /// escapes, comments, `$(( ))` arithmetic and heredocs, so separators (and
@@ -396,6 +408,12 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
     let mut in_comment = false;
     // Unclosed parens of a `$(( ... ))` arithmetic expansion; 0 = not in one.
     let mut arith_depth: u32 = 0;
+    // True when the open arithmetic construct is a `$((...))` expansion
+    // (part of a word) rather than a `((...))` command. Read only while
+    // `arith_depth > 0`.
+    let mut arith_is_expansion = false;
+    // Open `(` constructs outside arithmetic, innermost last.
+    let mut paren_stack: Vec<ParenKind> = Vec::new();
     // True when the next char starts a shell word — the only position where
     // `#` opens a comment.
     let mut at_word_start = true;
@@ -429,9 +447,10 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                 ')' => arith_depth -= 1,
                 _ => {}
             }
-            // `)` is a metacharacter: right after the closing `))` bash
-            // grants comment position (`((x=1))# note` is a comment).
-            at_word_start = arith_depth == 0;
+            // After the closing `))` of an arithmetic *command* bash grants
+            // comment position (`((x=1))# note`). An arithmetic *expansion*
+            // is part of a word, so `$((1+1))#suffix` continues that word.
+            at_word_start = arith_depth == 0 && !arith_is_expansion;
             continue;
         }
         if in_comment && c != '\n' {
@@ -492,6 +511,7 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                 cur.push(c);
                 cur.push(chars.next().expect("peeked"));
                 arith_depth = 2;
+                arith_is_expansion = false;
                 at_word_start = false;
             }
             '$' if chars.peek() == Some(&'(') => {
@@ -500,6 +520,9 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                 if chars.peek() == Some(&'(') {
                     cur.push(chars.next().expect("peeked"));
                     arith_depth = 2;
+                    arith_is_expansion = true;
+                } else {
+                    paren_stack.push(ParenKind::CmdSubst);
                 }
                 at_word_start = false;
             }
@@ -591,9 +614,22 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
             }
             _ => {
                 cur.push(c);
-                // `)` too: `(echo ok)# c` — Bash starts a comment right
-                // after the closing paren.
-                at_word_start = matches!(c, ' ' | '\t' | '(' | ')');
+                match c {
+                    '(' => {
+                        // Bare `(` is a grouping subshell (the `$(` and `((`
+                        // forms are consumed by their own arms above).
+                        paren_stack.push(ParenKind::Subshell);
+                        at_word_start = true;
+                    }
+                    ')' => {
+                        // `(echo ok)# c` — comment right after the paren;
+                        // `$(cmd)#suffix` — the word goes on. A stray `)`
+                        // with nothing open keeps the metacharacter reading.
+                        at_word_start = !matches!(paren_stack.pop(), Some(ParenKind::CmdSubst));
+                    }
+                    ' ' | '\t' => at_word_start = true,
+                    _ => at_word_start = false,
+                }
             }
         }
     }
@@ -1280,17 +1316,68 @@ mod tests {
 
     #[test]
     fn comment_directly_after_arith_close() {
-        // `))# note` — bash grants comment position right after `))`.
+        // `))# note` — bash grants comment position right after the `))`
+        // of an arithmetic *command*.
         let cmd = "((x=1))# note <<EOF\n./gradlew test";
         assert_eq!(
             detect_rewrite(cmd).as_deref(),
             Some("((x=1))# note <<EOF\ngw ./gradlew test")
         );
+        // An arithmetic *expansion* is part of a word: `$((1+1))#` does not
+        // open a comment, so the `<<EOF` is a real heredoc and everything
+        // after the opening line is its (unterminated) body — data.
         let cmd = "echo $((1+1))# note <<EOF\n./gradlew test";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    // Paren context before `#` (issue #30) ────────────────────────────────────
+
+    #[test]
+    fn hash_after_command_substitution_continues_word() {
+        // `$(cmd)#...` continues the word (bash: `foo# docs mention` is one
+        // argument), so `<<EOF` is a real redirect and the body is data.
+        let cmd = "echo $(printf foo)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after";
         assert_eq!(
             detect_rewrite(cmd).as_deref(),
-            Some("echo $((1+1))# note <<EOF\ngw ./gradlew test")
+            Some("echo $(printf foo)# docs mention <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
         );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_arith_expansion_continues_word() {
+        let cmd = "echo $((1+1))# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $((1+1))# docs mention <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_grouping_subshell_opens_comment() {
+        // Control: after a grouping subshell's `)` the `#` really is a
+        // comment, so `<<EOF` is commentary and the following lines are
+        // live commands (the bare `EOF` line is just a failing command).
+        let cmd = "(echo ok)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("(echo ok)# docs mention <<EOF\ngw ./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_subshell_nested_in_substitution_continues_word() {
+        // The innermost closed paren decides: the subshell's `)` closes
+        // inside the substitution, and the substitution's own `)` keeps
+        // the word going — bash prints `ok# tail` as one argument.
+        let cmd = "echo $( (echo ok) )# tail <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $( (echo ok) )# tail <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
     }
 
     #[test]
