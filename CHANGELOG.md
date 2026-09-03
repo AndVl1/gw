@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.14](https://github.com/AndVl1/gw/compare/v0.2.13...v0.2.14) - 2026-09-03
+
+### Fixed
+
+- *(hook)* track command position and case patterns in the paren lexer
+- *(hook)* resume shell lexing inside substitutions nested in ${...}
+- *(hook)* treat extglob and ${} parens as word-level, not subshells
+- *(hook)* treat process substitution and compound assignment parens as word-level
+- *(hook)* distinguish subshell close from substitutions before #
+- *(hook)* full Bash quote removal and comment boundaries in heredoc lexer
+- *(hook)* parse heredocs with single-pass shell lexer
+- *(hook)* do not rewrite gradlew mentioned inside heredoc bodies
+
 ## [0.2.13](https://github.com/AndVl1/gw/compare/v0.2.12...v0.2.13) - 2026-06-22
 
 ### Added
