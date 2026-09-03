@@ -417,6 +417,16 @@ enum ParenKind {
     Extglob,
 }
 
+/// One open `(` on the lexer's stack.
+struct OpenParen {
+    kind: ParenKind,
+    /// `brace_depth` of the enclosing context, restored when this paren
+    /// closes. Inside `$(…)`, `<(…)`, `>(…)` normal shell syntax resumes even
+    /// when the substitution sits inside a `${…}` (`${x:-$(echo # c)}`), so
+    /// each substitution starts at brace depth 0.
+    outer_brace_depth: u32,
+}
+
 impl ParenKind {
     /// Whether `#` immediately after this construct's closing `)` opens a
     /// comment (true) or continues the current word (false).
@@ -452,17 +462,20 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
     // Open `(` constructs outside arithmetic, innermost last. Parens may
     // span separators and newlines, so this is never reset at a segment
     // boundary.
-    let mut paren_stack: Vec<ParenKind> = Vec::new();
+    let mut paren_stack: Vec<OpenParen> = Vec::new();
     // The plain (unquoted, unescaped) char consumed by the previous loop
     // iteration, if that char was plain. Tells `name=(` from `(`. Taken
     // (reset) at the top of every iteration, so only the `_` arm below ever
     // sets it — and only a backslash-newline continuation carries it over.
     let mut last_plain: Option<char> = None;
-    // Nesting depth of `${...}` parameter expansions. Their contents are
-    // literal to this lexer: a `(` in `${x:-(}` or `${f%%(*}` is pattern
-    // text, not shell grouping, and `#` inside is never a comment. Not reset
-    // at newlines (bash allows them inside); an unterminated `${` is a
-    // syntax error whose only effect here is suppressed comment detection.
+    // Nesting depth of `${...}` parameter expansions in the *current* paren
+    // context. Their contents are literal to this lexer: a `(` in `${x:-(}`
+    // or `${f%%(*}` is pattern text, not shell grouping, and `#` inside is
+    // never a comment — except inside a nested `$(…)`/`<(…)`/`>(…)`, where
+    // shell syntax resumes (the depth is saved on `paren_stack` and starts
+    // from 0 there). Not reset at newlines (bash allows them inside); an
+    // unterminated `${` is a syntax error whose only effect here is
+    // suppressed comment detection.
     let mut brace_depth: u32 = 0;
     // True when the next char starts a shell word — the only position where
     // `#` opens a comment.
@@ -584,7 +597,11 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                     arith_depth = 2;
                     arith_is_expansion = true;
                 } else {
-                    paren_stack.push(ParenKind::CmdSubst);
+                    paren_stack.push(OpenParen {
+                        kind: ParenKind::CmdSubst,
+                        outer_brace_depth: brace_depth,
+                    });
+                    brace_depth = 0;
                 }
                 at_word_start = false;
             }
@@ -604,7 +621,11 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                 // inside the current word, so `#` after its `)` is no comment.
                 cur.push(c);
                 cur.push(chars.next().expect("peeked"));
-                paren_stack.push(ParenKind::ProcSubst);
+                paren_stack.push(OpenParen {
+                    kind: ParenKind::ProcSubst,
+                    outer_brace_depth: brace_depth,
+                });
+                brace_depth = 0;
                 at_word_start = false;
             }
             '\'' => {
@@ -706,14 +727,23 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                             _ => ParenKind::Subshell,
                         };
                         at_word_start = !matches!(kind, ParenKind::Extglob);
-                        paren_stack.push(kind);
+                        // Reached only with `brace_depth == 0` (the guard
+                        // above), so the saved depth is always 0 here.
+                        paren_stack.push(OpenParen {
+                            kind,
+                            outer_brace_depth: brace_depth,
+                        });
                     }
                     ')' => {
                         // A stray `)` with nothing open (`case` pattern) is
                         // still a metacharacter: `a)# c` is a comment.
-                        at_word_start = paren_stack
-                            .pop()
-                            .is_none_or(|kind| kind.grants_comment_position());
+                        at_word_start = match paren_stack.pop() {
+                            Some(open) => {
+                                brace_depth = open.outer_brace_depth;
+                                open.kind.grants_comment_position()
+                            }
+                            None => true,
+                        };
                     }
                     ' ' | '\t' => at_word_start = true,
                     _ => at_word_start = false,
@@ -1715,6 +1745,56 @@ mod tests {
     }
 
     #[test]
+    fn shell_syntax_resumes_inside_substitution_nested_in_parameter_expansion() {
+        // `${x:-$(…)}` — inside the `$(…)` bash lexes normally again: `#`
+        // opens a comment, so `<<FAKE` is commentary, the body line is a
+        // live command (base and 270c391 wrapped it) and the `)}` closes
+        // both constructs.
+        let cmd = "echo ${x:-$(echo # docs <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$(echo # docs <<FAKE\ngw ./gradlew body\nFAKE\n)}\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // Same for process substitution inside `${…}`.
+        let cmd = "cat ${x:-<(echo # c <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat ${x:-<(echo # c <<FAKE\ngw ./gradlew body\nFAKE\n)}\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn brace_depth_restored_after_nested_substitution_closes() {
+        // After the inner `$(…)` closes, the lexer is back inside `${…}`:
+        // `}` closes it and `#` right after continues the word (bash prints
+        // `a# d`), so the `<<EOF` is a real heredoc.
+        let cmd = "echo ${x:-$(echo a # c\n)}# d <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$(echo a # c\n)}# d <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // A `${y%)}` inside the nested `$(…)` is literal there too, and the
+        // outer `${…}` is still open when the `$(…)` closes.
+        let cmd = "echo ${x:-$(echo ${y%)})}# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$(echo ${y%)})}# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // A brace group inside the nested `$(…)`: its `}` is a plain char
+        // (depth 0 there) and must not close the outer `${`.
+        let cmd = "echo ${x:-$( { echo g; } )}# d <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$( { echo g; } )}# d <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
     fn segments_reconstruct_paren_context_cases() {
         for cmd in [
             "echo $(printf foo)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after",
@@ -1743,6 +1823,11 @@ mod tests {
             "echo $(echo ${x%)})# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
             "echo ${x:-a # b}# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
             "echo ${x:-a\nb}# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo ${x:-$(echo # docs <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after",
+            "cat ${x:-<(echo # c <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after",
+            "echo ${x:-$(echo a # c\n)}# d <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo ${x:-$(echo ${y%)})}# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo ${x:-$( { echo g; } )}# d <<EOF\n./gradlew body\nEOF\n./gradlew after",
             "echo $((1+1))# note <<EOF\n./gradlew test",
         ] {
             assert_eq!(reconstruct(cmd), cmd, "reconstruction differs for {cmd:?}");
