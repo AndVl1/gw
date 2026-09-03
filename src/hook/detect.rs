@@ -383,9 +383,151 @@ fn arith_command_ahead(chars: &std::iter::Peekable<std::str::Chars>) -> bool {
     ahead.next().is_none()
 }
 
+/// What kind of construct an unmatched `(` opened — decides whether `#`
+/// right after the matching `)` starts a comment or continues the current
+/// word. Only [`ParenKind::Subshell`] grants comment position; every other
+/// kind is a word-level construct whose `)` is followed by more of the same
+/// word (so a `<<EOF` after `$(cmd)#x` is a real heredoc, not commentary).
+///
+/// Arithmetic `((...))` / `$((...))` is tracked separately by `arith_depth`
+/// because separators and `<<` inside it must not be lexed as shell syntax.
+enum ParenKind {
+    /// `(cmd)` grouping subshell or `f()` definition: `)` is a
+    /// metacharacter, `#` right after it opens a comment.
+    Subshell,
+    /// `$(cmd)`: expands inside the surrounding word (`$(cmd)#suffix`).
+    CmdSubst,
+    /// `<(cmd)` / `>(cmd)`: expands to a `/dev/fd/N` path inside the
+    /// surrounding word (`<(cmd)#suffix`).
+    ProcSubst,
+    /// Compound assignment `name=(...)`, `name+=(...)`, `name[i]=(...)` —
+    /// standalone or as a `declare`/`local` argument: the parens belong to
+    /// the assignment word (`a=(1 2)#x` is the single word `a=(1 2)#x`).
+    /// Recognised as a `(` directly after an unquoted, unescaped `=`: in
+    /// valid Bash nothing else puts `(` there.
+    Assignment,
+    /// Extended glob `?(…)`, `*(…)`, `+(…)`, `@(…)`, `!(…)` (`shopt -s
+    /// extglob`): the pattern is one word (`@(foo)#x` is the word
+    /// `@(foo)#x`). Recognised as a `(` directly after an unquoted,
+    /// unescaped operator char. With extglob off the first four are
+    /// syntax errors, so treating them as word-level costs nothing. `!(`
+    /// is ambiguous at command position: with extglob off it is the
+    /// reserved word `!` negating a subshell (`!(cmd)# c` is a comment),
+    /// with extglob on it is a pattern (`!(cmd)#` is one word). The hook
+    /// cannot see shopt state, so it takes the extglob reading everywhere:
+    /// that can only miss a rewrite, never rewrite heredoc data. `! (cmd)`
+    /// with a space is unambiguous and stays a negated subshell.
+    Extglob,
+    /// A `case … esac` compound command (pushed by the reserved word `case`,
+    /// popped by `esac`). Its pattern terminators `)` belong to `case`
+    /// syntax: they close no paren, so a `)` while this is on top of the
+    /// stack pops nothing and grants comment position (`a)# c`).
+    Case(CasePhase),
+}
+
+/// Where the lexer is inside a `case` command. Matters because reserved
+/// words are only reserved at command position: in the pattern phase the
+/// words are the `case` WORD, `in`, and patterns (`case case in case) …`,
+/// `if) …` are all valid), so only `esac` is recognised there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CasePhase {
+    /// From `case` up to a pattern's terminating `)`, and again after each
+    /// `;;` / `;&` / `;;&`.
+    Pattern,
+    /// A clause body: a command list.
+    Body,
+}
+
+/// One open `(` on the lexer's stack.
+struct OpenParen {
+    kind: ParenKind,
+    /// `brace_depth` of the enclosing context, restored when this paren
+    /// closes. Inside `$(…)`, `<(…)`, `>(…)` normal shell syntax resumes even
+    /// when the substitution sits inside a `${…}` (`${x:-$(echo # c)}`), so
+    /// each substitution starts at brace depth 0.
+    outer_brace_depth: u32,
+}
+
+impl ParenKind {
+    /// Whether `#` immediately after this construct's closing `)` opens a
+    /// comment (true) or continues the current word (false).
+    fn grants_comment_position(&self) -> bool {
+        match self {
+            // `Case` is never popped by `)` (see the `)` arm); listed for
+            // exhaustiveness with the reading its pattern terminators have.
+            ParenKind::Subshell | ParenKind::Case(_) => true,
+            ParenKind::CmdSubst
+            | ParenKind::ProcSubst
+            | ParenKind::Assignment
+            | ParenKind::Extglob => false,
+        }
+    }
+}
+
+/// Reserved words the lexer cares about when they stand at command position.
+/// `case`/`esac` delimit a region whose pattern terminators `)` close no
+/// paren; the others are followed by another command, so the word after them
+/// is at command position again (`{ case …`, `then case …`). `chars` points
+/// just past `first`. A word counts only when delimited by whitespace, a
+/// metacharacter or end of input — `{a,b}` is a brace expansion, `case1` a
+/// plain word, and `!(` is an extglob pattern rather than the reserved `!`
+/// (see [`ParenKind::Extglob`]). Backslash-newline inside the word is a line
+/// continuation and vanishes (`ca\␤se` is `case`). Returns the word and how
+/// many chars after `first` it spans in the input.
+///
+/// `[[ … ]]` is deliberately not modelled: its `(`/`)` grouping is always
+/// balanced, so a phantom subshell frame opens and closes harmlessly.
+fn reserved_word_ahead(
+    first: char,
+    chars: &std::iter::Peekable<std::str::Chars>,
+) -> Option<(&'static str, usize)> {
+    const WORDS: &[&str] = &[
+        "case", "esac", "{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do",
+        "done", "time", "coproc",
+    ];
+    let mut word = String::from(first);
+    let mut ahead = chars.clone();
+    let mut span = 0usize;
+    if first.is_ascii_alphabetic() {
+        loop {
+            match ahead.peek() {
+                Some(&n) if n.is_ascii_alphabetic() => {
+                    word.push(n);
+                    ahead.next();
+                    span += 1;
+                }
+                Some('\\') => {
+                    let mut after = ahead.clone();
+                    after.next();
+                    if after.peek() != Some(&'\n') {
+                        break;
+                    }
+                    ahead = after;
+                    ahead.next();
+                    span += 2;
+                }
+                _ => break,
+            }
+        }
+    }
+    let delimited = matches!(
+        ahead.peek(),
+        None | Some(' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>')
+    );
+    if !delimited || (first == '!' && ahead.peek() == Some(&'(')) {
+        return None;
+    }
+    WORDS
+        .iter()
+        .copied()
+        .find(|w| *w == word)
+        .map(|w| (w, span))
+}
+
 /// Split a shell command line into [`Segment`]s at top-level `;`, `&&`,
 /// `||`, `|`, `&`, `\n`. Single-pass lexer tracking quotes, backslash
-/// escapes, comments, `$(( ))` arithmetic and heredocs, so separators (and
+/// escapes, comments, `$(( ))` arithmetic, `${ }` parameter expansions,
+/// `case … esac` pattern terminators and heredocs, so separators (and
 /// `gradlew` mentions) inside any of those are treated as data.
 fn split_segments(cmd: &str) -> Vec<Segment> {
     let mut segs: Vec<Segment> = Vec::new();
@@ -396,12 +538,42 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
     let mut in_comment = false;
     // Unclosed parens of a `$(( ... ))` arithmetic expansion; 0 = not in one.
     let mut arith_depth: u32 = 0;
+    // True when the open arithmetic construct is a `$((...))` expansion
+    // (part of a word) rather than a `((...))` command. Read only while
+    // `arith_depth > 0`.
+    let mut arith_is_expansion = false;
+    // Open `(` constructs outside arithmetic, innermost last. Parens may
+    // span separators and newlines, so this is never reset at a segment
+    // boundary.
+    let mut paren_stack: Vec<OpenParen> = Vec::new();
+    // The plain (unquoted, unescaped) char consumed by the previous loop
+    // iteration, if that char was plain. Tells `name=(` from `(`. Taken
+    // (reset) at the top of every iteration, so only the `_` arm below ever
+    // sets it — and only a backslash-newline continuation carries it over.
+    let mut last_plain: Option<char> = None;
+    // Nesting depth of `${...}` parameter expansions in the *current* paren
+    // context. Their contents are literal to this lexer: a `(` in `${x:-(}`
+    // or `${f%%(*}` is pattern text, not shell grouping, and `#` inside is
+    // never a comment — except inside a nested `$(…)`/`<(…)`/`>(…)`, where
+    // shell syntax resumes (the depth is saved on `paren_stack` and starts
+    // from 0 there). Not reset at newlines (bash allows them inside); an
+    // unterminated `${` is a syntax error whose only effect here is
+    // suppressed comment detection.
+    let mut brace_depth: u32 = 0;
     // True when the next char starts a shell word — the only position where
     // `#` opens a comment.
     let mut at_word_start = true;
+    // True when the next word may be a reserved word (`case`, `esac`, `{`,
+    // `then`, …): at the start of every command list (after separators,
+    // newlines, `(`, `$(`, `<(`, `>(`, a `case` pattern's `)`) and right
+    // after a reserved word that introduces a command (`{ case`, `then
+    // case`). Blanks keep it; the first char of anything else — a plain
+    // word, quote, escape, redirection, expansion — clears it.
+    let mut at_cmd_start = true;
     // Heredocs opened on the current line, in order; bodies follow the newline.
     let mut pending_heredocs: Vec<Heredoc> = Vec::new();
     while let Some(c) = chars.next() {
+        let prev_plain = last_plain.take();
         if in_single {
             cur.push(c);
             if c == '\'' {
@@ -429,9 +601,10 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                 ')' => arith_depth -= 1,
                 _ => {}
             }
-            // `)` is a metacharacter: right after the closing `))` bash
-            // grants comment position (`((x=1))# note` is a comment).
-            at_word_start = arith_depth == 0;
+            // After the closing `))` of an arithmetic *command* bash grants
+            // comment position (`((x=1))# note`). An arithmetic *expansion*
+            // is part of a word, so `$((1+1))#suffix` continues that word.
+            at_word_start = arith_depth == 0 && !arith_is_expansion;
             continue;
         }
         if in_comment && c != '\n' {
@@ -478,6 +651,7 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                 tail,
             });
             at_word_start = true;
+            at_cmd_start = true;
             continue;
         }
         match c {
@@ -492,7 +666,22 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                 cur.push(c);
                 cur.push(chars.next().expect("peeked"));
                 arith_depth = 2;
+                arith_is_expansion = false;
                 at_word_start = false;
+                at_cmd_start = false;
+            }
+            '$' if chars.peek() == Some(&'{') => {
+                cur.push(c);
+                cur.push(chars.next().expect("peeked"));
+                brace_depth += 1;
+                at_word_start = false;
+                at_cmd_start = false;
+            }
+            '}' if brace_depth > 0 => {
+                cur.push(c);
+                brace_depth -= 1;
+                at_word_start = false;
+                at_cmd_start = false;
             }
             '$' if chars.peek() == Some(&'(') => {
                 cur.push(c);
@@ -500,8 +689,19 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                 if chars.peek() == Some(&'(') {
                     cur.push(chars.next().expect("peeked"));
                     arith_depth = 2;
+                    arith_is_expansion = true;
+                    at_word_start = false;
+                } else {
+                    paren_stack.push(OpenParen {
+                        kind: ParenKind::CmdSubst,
+                        outer_brace_depth: brace_depth,
+                    });
+                    brace_depth = 0;
+                    // The substitution opens a fresh command list: `$(# c`
+                    // is a comment, `$(case …` a reserved word.
+                    at_word_start = true;
                 }
-                at_word_start = false;
+                at_cmd_start = true;
             }
             '<' if chars.peek() == Some(&'<') => {
                 cur.push(c);
@@ -513,16 +713,33 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                     pending_heredocs.push(h);
                 }
                 at_word_start = false;
+                at_cmd_start = false;
+            }
+            '<' | '>' if chars.peek() == Some(&'(') => {
+                // Process substitution: `<(cmd)` / `>(cmd)` becomes a path
+                // inside the current word, so `#` after its `)` is no
+                // comment — but inside it a fresh command list starts.
+                cur.push(c);
+                cur.push(chars.next().expect("peeked"));
+                paren_stack.push(OpenParen {
+                    kind: ParenKind::ProcSubst,
+                    outer_brace_depth: brace_depth,
+                });
+                brace_depth = 0;
+                at_word_start = true;
+                at_cmd_start = true;
             }
             '\'' => {
                 in_single = true;
                 cur.push(c);
                 at_word_start = false;
+                at_cmd_start = false;
             }
             '"' => {
                 in_double = true;
                 cur.push(c);
                 at_word_start = false;
+                at_cmd_start = false;
             }
             '\\' => {
                 cur.push(c);
@@ -531,27 +748,43 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                     // line goes on, so no segment split, no heredoc body
                     // start, and — since both chars vanish in shell — the
                     // word-boundary state is whatever it was before the
-                    // backslash (`echo foo \␤# c` — the `#` opens a comment).
+                    // backslash (`echo foo \␤# c` — the `#` opens a comment,
+                    // `a=\␤(1 2)#x` is still a compound assignment).
                     Some('\n') => {
                         cur.push(chars.next().expect("peeked"));
+                        last_plain = prev_plain;
                     }
                     Some(&n) => {
                         cur.push(n);
                         chars.next();
                         at_word_start = false;
+                        at_cmd_start = false;
                     }
                     None => {
                         at_word_start = false;
+                        at_cmd_start = false;
                     }
                 }
             }
             ';' => {
+                // `;;`, `;&`, `;;&` end a `case` clause: what follows is the
+                // next pattern list (or `esac`), not a command.
+                if matches!(chars.peek(), Some(';' | '&')) {
+                    if let Some(OpenParen {
+                        kind: kind @ ParenKind::Case(CasePhase::Body),
+                        ..
+                    }) = paren_stack.last_mut()
+                    {
+                        *kind = ParenKind::Case(CasePhase::Pattern);
+                    }
+                }
                 segs.push(Segment {
                     text: std::mem::take(&mut cur),
                     sep: ";".to_string(),
                     tail: String::new(),
                 });
                 at_word_start = true;
+                at_cmd_start = true;
             }
             '&' => {
                 if chars.peek() == Some(&'&') {
@@ -562,10 +795,12 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                         tail: String::new(),
                     });
                     at_word_start = true;
+                    at_cmd_start = true;
                 } else if cur.ends_with('>') || chars.peek() == Some(&'>') {
                     // Redirect form: `2>&1`, `>&2`, `&>file`. Keep `&` literal.
                     cur.push(c);
                     at_word_start = false;
+                    at_cmd_start = false;
                 } else {
                     segs.push(Segment {
                         text: std::mem::take(&mut cur),
@@ -573,6 +808,7 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                         tail: String::new(),
                     });
                     at_word_start = true;
+                    at_cmd_start = true;
                 }
             }
             '|' => {
@@ -588,12 +824,128 @@ fn split_segments(cmd: &str) -> Vec<Segment> {
                     tail: String::new(),
                 });
                 at_word_start = true;
+                at_cmd_start = true;
             }
             _ => {
+                // In a `case` pattern phase the words are WORD, `in` and
+                // patterns, never commands: only `esac` is reserved there.
+                let in_case_pattern = matches!(
+                    paren_stack.last(),
+                    Some(OpenParen {
+                        kind: ParenKind::Case(CasePhase::Pattern),
+                        ..
+                    })
+                );
+                if at_cmd_start && brace_depth == 0 {
+                    if let Some((word, span)) = reserved_word_ahead(c, &chars)
+                        .filter(|(w, _)| !in_case_pattern || *w == "esac")
+                    {
+                        cur.push(c);
+                        for _ in 0..span {
+                            cur.push(chars.next().expect("word was peeked"));
+                        }
+                        match word {
+                            "case" => paren_stack.push(OpenParen {
+                                kind: ParenKind::Case(CasePhase::Pattern),
+                                outer_brace_depth: brace_depth,
+                            }),
+                            // Same context as the `case`, so no depth to
+                            // restore. An `esac` with no `case` open is a
+                            // syntax error; ignore it.
+                            "esac" => {
+                                if matches!(
+                                    paren_stack.last(),
+                                    Some(OpenParen {
+                                        kind: ParenKind::Case(_),
+                                        ..
+                                    })
+                                ) {
+                                    paren_stack.pop();
+                                }
+                            }
+                            _ => {}
+                        }
+                        at_word_start = false;
+                        // `case` is followed by its WORD, and `esac`, `fi`,
+                        // `done`, `}` end a command; the rest introduce one.
+                        at_cmd_start = !matches!(word, "case" | "esac" | "fi" | "done" | "}");
+                        continue;
+                    }
+                }
                 cur.push(c);
-                // `)` too: `(echo ok)# c` — Bash starts a comment right
-                // after the closing paren.
-                at_word_start = matches!(c, ' ' | '\t' | '(' | ')');
+                match c {
+                    // Inside `${...}` every char is expansion text: parens
+                    // don't open or close anything, spaces don't grant
+                    // comment position (`${x:-a # b}` prints `a # b`).
+                    _ if brace_depth > 0 => {
+                        at_word_start = false;
+                        at_cmd_start = false;
+                    }
+                    '(' if in_case_pattern => {
+                        // `(pat)` form of a case pattern: the paren is `case`
+                        // syntax, not a subshell — the matching `)` is the
+                        // pattern terminator handled below.
+                        at_word_start = false;
+                        at_cmd_start = false;
+                    }
+                    '(' => {
+                        // `$(`, `<(`, `>(` and `((` were consumed by their
+                        // own arms. This `(` is part of a compound assignment
+                        // (`a=(1 2)`, `a+=(3)`, `declare -a a=(1)`), part of
+                        // an extglob pattern (`@(foo)`), or a metacharacter
+                        // opening a grouping subshell / `f()` definition. Only
+                        // the last grants comment position after `)`.
+                        // Comments are allowed inside an assignment's parens
+                        // and a subshell, but a pattern is one word.
+                        let kind = match prev_plain {
+                            Some('=') => ParenKind::Assignment,
+                            Some('?' | '*' | '+' | '@' | '!') => ParenKind::Extglob,
+                            _ => ParenKind::Subshell,
+                        };
+                        at_word_start = !matches!(kind, ParenKind::Extglob);
+                        // Only a subshell opens a new command list.
+                        at_cmd_start = matches!(kind, ParenKind::Subshell);
+                        // Reached only with `brace_depth == 0` (the guard
+                        // above), so the saved depth is always 0 here.
+                        paren_stack.push(OpenParen {
+                            kind,
+                            outer_brace_depth: brace_depth,
+                        });
+                    }
+                    ')' => match paren_stack.last_mut() {
+                        Some(OpenParen {
+                            kind: kind @ ParenKind::Case(_),
+                            ..
+                        }) => {
+                            // `case` pattern terminator: closes no paren,
+                            // and the clause body that follows is a fresh
+                            // command list (`a)# c` is a comment).
+                            *kind = ParenKind::Case(CasePhase::Body);
+                            at_word_start = true;
+                            at_cmd_start = true;
+                        }
+                        Some(_) => {
+                            let open = paren_stack.pop().expect("peeked");
+                            brace_depth = open.outer_brace_depth;
+                            at_word_start = open.kind.grants_comment_position();
+                            // Closing a word-level construct continues the
+                            // word; closing a subshell ends a command.
+                            at_cmd_start = false;
+                        }
+                        None => {
+                            // A stray `)` with nothing open is still a
+                            // metacharacter: comment position.
+                            at_word_start = true;
+                            at_cmd_start = false;
+                        }
+                    },
+                    ' ' | '\t' => at_word_start = true,
+                    _ => {
+                        at_word_start = false;
+                        at_cmd_start = false;
+                    }
+                }
+                last_plain = Some(c);
             }
         }
     }
@@ -1280,17 +1632,629 @@ mod tests {
 
     #[test]
     fn comment_directly_after_arith_close() {
-        // `))# note` — bash grants comment position right after `))`.
+        // `))# note` — bash grants comment position right after the `))`
+        // of an arithmetic *command*.
         let cmd = "((x=1))# note <<EOF\n./gradlew test";
         assert_eq!(
             detect_rewrite(cmd).as_deref(),
             Some("((x=1))# note <<EOF\ngw ./gradlew test")
         );
+        // An arithmetic *expansion* is part of a word: `$((1+1))#` does not
+        // open a comment, so the `<<EOF` is a real heredoc and everything
+        // after the opening line is its (unterminated) body — data.
         let cmd = "echo $((1+1))# note <<EOF\n./gradlew test";
+        assert_eq!(detect_rewrite(cmd), None);
+    }
+
+    // Paren context before `#` (issue #30) ────────────────────────────────────
+
+    #[test]
+    fn hash_after_command_substitution_continues_word() {
+        // `$(cmd)#...` continues the word (bash: `foo# docs mention` is one
+        // argument), so `<<EOF` is a real redirect and the body is data.
+        let cmd = "echo $(printf foo)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after";
         assert_eq!(
             detect_rewrite(cmd).as_deref(),
-            Some("echo $((1+1))# note <<EOF\ngw ./gradlew test")
+            Some("echo $(printf foo)# docs mention <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
         );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_arith_expansion_continues_word() {
+        let cmd = "echo $((1+1))# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $((1+1))# docs mention <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_grouping_subshell_opens_comment() {
+        // Control: after a grouping subshell's `)` the `#` really is a
+        // comment, so `<<EOF` is commentary and the following lines are
+        // live commands (the bare `EOF` line is just a failing command).
+        let cmd = "(echo ok)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("(echo ok)# docs mention <<EOF\ngw ./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_subshell_nested_in_substitution_continues_word() {
+        // The innermost closed paren decides: the subshell's `)` closes
+        // inside the substitution, and the substitution's own `)` keeps
+        // the word going — bash prints `ok# tail` as one argument.
+        let cmd = "echo $( (echo ok) )# tail <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $( (echo ok) )# tail <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_input_process_substitution_continues_word() {
+        // `<(cmd)` expands to `/dev/fd/N` inside the word: bash prints
+        // `/dev/fd/63# docs mention`, the `<<EOF` is a real heredoc.
+        let cmd = "echo <(printf foo)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo <(printf foo)# docs mention <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_output_process_substitution_continues_word() {
+        let cmd = "echo >(cat)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo >(cat)# docs mention <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_process_substitution_at_command_position() {
+        // Same rule when the substitution is the command word itself
+        // (bash: `/dev/fd/63#: No such file or directory`, then the body
+        // is fed to it as a heredoc).
+        let cmd = "<(true)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("<(true)# docs <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_compound_assignment_continues_word() {
+        // `a=(1 2)#x` is one assignment word (bash then runs `docs` with
+        // the heredoc as stdin), so the body is data. Same for `+=`.
+        let cmd = "a=(1 2)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("a=(1 2)# docs <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        let cmd = "a+=(1 2)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("a+=(1 2)# docs <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn comment_inside_compound_assignment() {
+        // Comments are allowed between array elements; the `<<EOF` in one
+        // is commentary and the next line is a live command.
+        let cmd = "a=(1 # docs mention <<EOF\n2)\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("a=(1 # docs mention <<EOF\n2)\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_function_parens_opens_comment() {
+        // `f()` parens are metacharacters even though `(` follows a word
+        // char: bash reads `# c <<EOF` as a comment and the next line as
+        // the function body.
+        let cmd = "f()# c <<EOF\n{ echo in-f; }; f\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("f()# c <<EOF\n{ echo in-f; }; f\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_case_pattern_opens_comment() {
+        // Stray `)` (nothing open): still a metacharacter.
+        let cmd = "case a in a)# c <<EOF\n./gradlew body;; esac\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case a in a)# c <<EOF\ngw ./gradlew body;; esac\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_arith_command_in_for_header_opens_comment() {
+        let cmd = "for ((i=0;i<1;i++))# c <<EOF\ndo echo loop; done\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("for ((i=0;i<1;i++))# c <<EOF\ndo echo loop; done\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn assignment_context_does_not_leak_across_lines() {
+        // A line ending in `=` must not make the `(` on the next line look
+        // like a compound assignment: it's a grouping subshell.
+        let cmd = "x=\n(echo ok)# c <<EOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("x=\n(echo ok)# c <<EOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn assignment_context_survives_line_continuation() {
+        // `a=\␤(1 2)#x` — the continuation vanishes, so this is still one
+        // compound-assignment word (bash runs `docs` with the heredoc as
+        // stdin) and the body is data.
+        let cmd = "a=\\\n(1 2)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("a=\\\n(1 2)# docs <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_declare_compound_assignment_continues_word() {
+        // `declare -a a=(1 2)# docs` — the `(1 2)#` stays inside the
+        // assignment argument (bash declares `docs` and reads the heredoc).
+        let cmd = "declare -a a=(1 2)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("declare -a a=(1 2)# docs <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_case_pattern_ending_in_equals_opens_comment() {
+        // `a=)` in a `case` pattern: the `)` closes nothing, `=` before it
+        // is irrelevant — bash reads `# c <<EOF` as a comment.
+        let cmd = "case a= in a=)# c <<EOF\n./gradlew body;; esac\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case a= in a=)# c <<EOF\ngw ./gradlew body;; esac\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_extglob_pattern_continues_word() {
+        // With `shopt -s extglob`, `@(foo)#x` is one word (bash prints
+        // `@(foo)# docs` unchanged when nothing matches); the `<<EOF` is a
+        // real heredoc and its body is data. Same for every operator.
+        for op in ['?', '*', '+', '@', '!'] {
+            let cmd = format!("echo {op}(foo)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after");
+            assert_eq!(
+                detect_rewrite(&cmd).as_deref(),
+                Some(
+                    format!("echo {op}(foo)# docs <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+                        .as_str()
+                ),
+                "operator {op}"
+            );
+            assert_eq!(reconstruct(&cmd), cmd, "operator {op}");
+        }
+    }
+
+    #[test]
+    fn hash_after_nested_extglob_pattern_continues_word() {
+        let cmd = "echo @(a|@(b))# docs <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo @(a|@(b))# docs <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn bang_paren_at_command_position_is_extglob() {
+        // `!(cmd)` at command position is ambiguous (negated subshell with
+        // extglob off, a pattern with extglob on). The extglob reading is
+        // the data-safe one: the heredoc is real and its body is data; with
+        // extglob off the only cost is a missed rewrite of the body line.
+        let cmd = "!(false)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("!(false)# docs <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_after_negated_subshell_with_space_opens_comment() {
+        // `! (cmd)` — a space separates the `!` from the `(`, so this is a
+        // negated grouping subshell, not an extglob pattern: `#` after `)`
+        // is a comment (bash runs the body line and `EOF` as commands).
+        let cmd = "! (false)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("! (false)# docs <<EOF\ngw ./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn paren_inside_parameter_expansion_does_not_open_subshell() {
+        // `${x:-(}` / `${f%%(*}` hold an unbalanced `(` as pattern text. It
+        // must not be pushed as a subshell, or the `)` that really closes
+        // the enclosing word-level construct would pop it and grant comment
+        // position — turning the real `<<EOF` into commentary and exposing
+        // the heredoc body to rewriting. Bash: `# c` stays in the word.
+        for head in [
+            "echo $(echo ${x:-(})",
+            "cat <(echo ${x:-(})",
+            "a=(${x:-(} b)",
+            "n=$(basename ${f%%(*})",
+            "echo $(echo ${var//(/[})",
+        ] {
+            let cmd = format!("{head}# c <<EOF\n./gradlew body\nEOF\n./gradlew after");
+            assert_eq!(
+                detect_rewrite(&cmd).as_deref(),
+                Some(format!("{head}# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after").as_str()),
+                "{head}"
+            );
+            assert_eq!(reconstruct(&cmd), cmd, "{head}");
+        }
+    }
+
+    #[test]
+    fn paren_inside_parameter_expansion_does_not_close_substitution() {
+        // Mirror case: `${x%)}` holds an unbalanced `)`; it must not pop
+        // the enclosing `$(`. Bash prints `# c` — the word continues.
+        let cmd = "echo $(echo ${x%)})# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $(echo ${x%)})# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // And a top-level `${x%)}` must not disturb a later real subshell.
+        let cmd = "echo ${x%)}\n(echo ok)# c <<EOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x%)}\n(echo ok)# c <<EOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn hash_inside_parameter_expansion_is_not_comment() {
+        // Bash prints `a # b# c`: nothing inside `${...}` opens a comment,
+        // so the `<<EOF` after the closing brace is a real heredoc.
+        let cmd = "echo ${x:-a # b}# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-a # b}# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn shell_syntax_resumes_inside_substitution_nested_in_parameter_expansion() {
+        // `${x:-$(…)}` — inside the `$(…)` bash lexes normally again: `#`
+        // opens a comment, so `<<FAKE` is commentary, the body line is a
+        // live command (base and 270c391 wrapped it) and the `)}` closes
+        // both constructs.
+        let cmd = "echo ${x:-$(echo # docs <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$(echo # docs <<FAKE\ngw ./gradlew body\nFAKE\n)}\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // Same for process substitution inside `${…}`.
+        let cmd = "cat ${x:-<(echo # c <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat ${x:-<(echo # c <<FAKE\ngw ./gradlew body\nFAKE\n)}\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn brace_depth_restored_after_nested_substitution_closes() {
+        // After the inner `$(…)` closes, the lexer is back inside `${…}`:
+        // `}` closes it and `#` right after continues the word (bash prints
+        // `a# d`), so the `<<EOF` is a real heredoc.
+        let cmd = "echo ${x:-$(echo a # c\n)}# d <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$(echo a # c\n)}# d <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // A `${y%)}` inside the nested `$(…)` is literal there too, and the
+        // outer `${…}` is still open when the `$(…)` closes.
+        let cmd = "echo ${x:-$(echo ${y%)})}# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$(echo ${y%)})}# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // A brace group inside the nested `$(…)`: its `}` is a plain char
+        // (depth 0 there) and must not close the outer `${`.
+        let cmd = "echo ${x:-$( { echo g; } )}# d <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$( { echo g; } )}# d <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn command_position_right_after_substitution_opens() {
+        // `$(`, `<(` and `>(` start a fresh command list: `#` as the very
+        // first char is a comment (bash runs the body line and `FAKE`).
+        let cmd = "echo ${x:-$(# docs <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$(# docs <<FAKE\ngw ./gradlew body\nFAKE\n)}\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        let cmd = "cat <(# docs <<FAKE\n./gradlew body\nFAKE\n)\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("cat <(# docs <<FAKE\ngw ./gradlew body\nFAKE\n)\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        let cmd = "echo >(# docs <<FAKE\n./gradlew body\nFAKE\n)\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo >(# docs <<FAKE\ngw ./gradlew body\nFAKE\n)\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn case_pattern_terminator_does_not_pop_enclosing_substitution() {
+        // `a)` inside `case … esac` belongs to `case` syntax: it must not
+        // pop the `$(` frame. Bash: `# docs <<EOF` is a comment, the body
+        // line is live, `EOF` is a (failing) command.
+        let cmd =
+            "echo ${x:-$(case a in a)# docs <<EOF\n./gradlew body;; esac\nEOF\n)}\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo ${x:-$(case a in a)# docs <<EOF\ngw ./gradlew body;; esac\nEOF\n)}\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // `(pat)` form and a `$(…)` as the `case` word.
+        let cmd = "case a in (a)# c <<EOF\n./gradlew body;; esac\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case a in (a)# c <<EOF\ngw ./gradlew body;; esac\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        let cmd = "case $(echo a) in a)# c <<EOF\n./gradlew body;; esac\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some(
+                "case $(echo a) in a)# c <<EOF\ngw ./gradlew body;; esac\nEOF\ngw ./gradlew after"
+            )
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn substitution_inside_case_body_still_closes_normally() {
+        // A `$(…)` inside a clause body pops its own frame: `$(true)#`
+        // continues the word (bash prints `# c`), heredoc is real.
+        let cmd = "case a in a) echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after;; esac";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case a in a) echo $(true)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after;; esac")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn esac_closes_the_innermost_case_only() {
+        // Nested `case`, both closed, then the `$(` closes: `)#` continues
+        // the word (bash prints `x# c`).
+        let cmd = "echo $(case a in a) case b in b) echo x;; esac;; esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $(case a in a) case b in b) echo x;; esac;; esac)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // `(pat)` form followed directly by a nested `case`.
+        let cmd = "case a in (a) case b in b) echo x;; esac;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case a in (a) case b in b) echo x;; esac;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // `|` between patterns splits segments but the `case` frame stays.
+        let cmd =
+            "echo $(case b in a|b) echo hit;; esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $(case b in a|b) echo hit;; esac)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn case_after_command_introducing_reserved_words() {
+        // `{` and `then` keep command position, so the `case` after them is
+        // the reserved word.
+        let cmd = "{ case a in a)# c <<EOF\n./gradlew body;; esac; }\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("{ case a in a)# c <<EOF\ngw ./gradlew body;; esac; }\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        let cmd =
+            "if true; then case a in a)# c <<EOF\n./gradlew body;; esac; fi\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("if true; then case a in a)# c <<EOF\ngw ./gradlew body;; esac; fi\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn esac_as_argument_is_not_reserved() {
+        // `echo esac` — not at command position, so it pops nothing and the
+        // `)` closes the `$(`: bash prints `esac# c`, heredoc is real.
+        let cmd = "echo $(echo esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $(echo esac)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn case_word_and_patterns_are_not_reserved_words() {
+        // The WORD after `case` and the patterns are plain words even when
+        // they spell a reserved word: `case case in case)` opens ONE case,
+        // so the `$(` closes normally and `)#` continues the word (bash
+        // prints `HIT# c`).
+        let cmd = "echo $(case case in case) echo HIT;; esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $(case case in case) echo HIT;; esac)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // A pattern after `;;` and a `(pat|pat)` list spelling reserved words.
+        let cmd = "case case in a) echo A;; case) echo HIT;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case case in a) echo A;; case) echo HIT;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        let cmd = "case if in (if|case) echo hit;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case if in (if|case) echo hit;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // `in` and the pattern on their own lines.
+        let cmd = "case if in\nif) echo hit;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case if in\nif) echo hit;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // `;&` fall-through, then `esac` on the same line.
+        let cmd = "case a in a) echo x;& esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case a in a) echo x;& esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn closing_word_level_paren_inside_case_body_is_not_command_position() {
+        // After `$(true)` closes inside a clause body the next word is an
+        // argument, so `!(zzz)` is an extglob pattern (bash -O extglob
+        // prints `!(zzz)# c`), not a negated subshell: the heredoc is real.
+        let cmd = "case a in a) echo $(true) !(zzz)# c <<EOF\n./gradlew body\nEOF\n./gradlew after;; esac";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case a in a) echo $(true) !(zzz)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after;; esac")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+        // A pattern containing a `$(…)` with a `)` inside.
+        let cmd = "case a in $(echo a)) echo hit;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("case a in $(echo a)) echo hit;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn reserved_word_split_by_line_continuation() {
+        // `ca\␤se` is the reserved word `case` (bash prints `H# c`).
+        let cmd =
+            "echo $(ca\\\nse a in a) echo H;; esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after";
+        assert_eq!(
+            detect_rewrite(cmd).as_deref(),
+            Some("echo $(ca\\\nse a in a) echo H;; esac)# c <<EOF\n./gradlew body\nEOF\ngw ./gradlew after")
+        );
+        assert_eq!(reconstruct(cmd), cmd);
+    }
+
+    #[test]
+    fn segments_reconstruct_paren_context_cases() {
+        for cmd in [
+            "echo $(printf foo)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo $((1+1))# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "(echo ok)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo $( (echo ok) )# tail <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo <(printf foo)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo >(cat)# docs mention <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "<(true)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "a=(1 2)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "a+=(1 2)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "a=(1 # docs mention <<EOF\n2)\n./gradlew after",
+            "f()# c <<EOF\n{ echo in-f; }; f\n./gradlew after",
+            "case a in a)# c <<EOF\n./gradlew body;; esac\nEOF\n./gradlew after",
+            "for ((i=0;i<1;i++))# c <<EOF\ndo echo loop; done\n./gradlew after",
+            "x=\n(echo ok)# c <<EOF\n./gradlew after",
+            "a=\\\n(1 2)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "declare -a a=(1 2)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "case a= in a=)# c <<EOF\n./gradlew body;; esac\nEOF\n./gradlew after",
+            "echo @(foo)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo !(foo)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "!(false)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo @(a|@(b))# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "! (false)# docs <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo $(echo ${x:-(})# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "a=(${x:-(} b)# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo $(echo ${x%)})# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo ${x:-a # b}# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo ${x:-a\nb}# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo ${x:-$(echo # docs <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after",
+            "cat ${x:-<(echo # c <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after",
+            "echo ${x:-$(echo a # c\n)}# d <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo ${x:-$(echo ${y%)})}# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo ${x:-$( { echo g; } )}# d <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo ${x:-$(# docs <<FAKE\n./gradlew body\nFAKE\n)}\n./gradlew after",
+            "cat <(# docs <<FAKE\n./gradlew body\nFAKE\n)\n./gradlew after",
+            "echo ${x:-$(case a in a)# docs <<EOF\n./gradlew body;; esac\nEOF\n)}\n./gradlew after",
+            "case a in (a)# c <<EOF\n./gradlew body;; esac\nEOF\n./gradlew after",
+            "case a in a) echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after;; esac",
+            "echo $(case a in a) case b in b) echo x;; esac;; esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo $(case b in a|b) echo hit;; esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "{ case a in a)# c <<EOF\n./gradlew body;; esac; }\nEOF\n./gradlew after",
+            "if true; then case a in a)# c <<EOF\n./gradlew body;; esac; fi\nEOF\n./gradlew after",
+            "echo $(echo esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo $(case case in case) echo HIT;; esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "case if in (if|case) echo hit;; esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "case a in a) echo x;& esac; echo $(true)# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "case a in a) echo $(true) !(zzz)# c <<EOF\n./gradlew body\nEOF\n./gradlew after;; esac",
+            "echo $(ca\\\nse a in a) echo H;; esac)# c <<EOF\n./gradlew body\nEOF\n./gradlew after",
+            "echo $((1+1))# note <<EOF\n./gradlew test",
+        ] {
+            assert_eq!(reconstruct(cmd), cmd, "reconstruction differs for {cmd:?}");
+        }
     }
 
     #[test]
